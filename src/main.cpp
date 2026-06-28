@@ -3,7 +3,10 @@
 #include "VeDirectReader.hpp"
 #include "VeDirectTextParser.hpp"
 #include "FieldInterpreter.hpp"
-#include "FieldInterpreter.hpp"
+#include "DeviceCatalog.hpp"
+#include "DeviceInterpreter.hpp"
+
+
 
 HardwareSerial VictronSerial(1);
 
@@ -33,6 +36,9 @@ void loop()
         if (parser.parse(reader.read()))
         {
             FieldInterpreter::print(parser.frame());
+
+            DeviceInterpreter::print(parser.frame());
+
             parser.reset();
         }
     }

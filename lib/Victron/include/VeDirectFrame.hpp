@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 
 #include "VeDirectField.hpp"
 
@@ -22,10 +23,30 @@ struct VeDirectFrame
 
     bool checksumValid = false;
 
+    /**************************************************************************
+     * Frame zurücksetzen.
+     **************************************************************************/
     void clear()
     {
         fieldCount = 0;
         checksum = 0;
         checksumValid = false;
+    }
+
+    /**************************************************************************
+     * Feld anhand seines Labels suchen.
+     **************************************************************************/
+    const VeDirectField* find(const char* label) const
+    {
+        for (std::size_t i = 0; i < fieldCount; ++i)
+        {
+            if (std::strcmp(fields[i].label.data(),
+                            label) == 0)
+            {
+                return &fields[i];
+            }
+        }
+
+        return nullptr;
     }
 };
