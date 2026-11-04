@@ -41,5 +41,43 @@ enum class SemanticField : uint16_t
     MaximumPowerToday,
     MaximumPowerYesterday,
 
-    DaySequence
+    DaySequence,
+
+    BatteryPower,
+
+    StateOfCharge,
+    TimeToGo,
+
+    AlarmState,
+    AlarmReason,
+
+    ConsumedAmpHours,
+
+    DepthDeepestDischarge,
+    DepthLastDischarge,
+    DepthAverageDischarge,
+
+    ChargeCycles,
+    FullDischarges,
+
+    CumulativeAmpHours,
+
+    MinimumBatteryVoltage,
+    MaximumBatteryVoltage,
+
+    SecondsSinceFullCharge,
+
+    AutoSynchronizations,
+
+    LowVoltageAlarms,
+    HighVoltageAlarms,
+
+    MinimumAuxVoltage,
+    MaximumAuxVoltage,
+
+    DischargedEnergy,
+    ChargedEnergy,
+
+    DeviceName,
+    MonitorMode
 };

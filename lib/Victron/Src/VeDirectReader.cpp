@@ -51,3 +51,11 @@ char VeDirectReader::read()
 {
     return static_cast<char>(m_serial.read());
 }
+
+void VeDirectReader::flush()
+{
+    while (m_serial.available())
+    {
+        m_serial.read();
+    }
+}

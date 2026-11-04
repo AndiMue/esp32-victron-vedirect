@@ -27,10 +27,9 @@ public:
         uint32_t baudrate = 19200);
 
     void begin();
-
     bool available() const;
-
     char read();
+    void flush();
 
 private:
 
@@ -38,6 +37,5 @@ private:
 
     uint8_t m_rxPin;
     uint8_t m_txPin;
-
     uint32_t m_baudrate;
 };

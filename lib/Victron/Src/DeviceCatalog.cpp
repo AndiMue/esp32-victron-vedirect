@@ -29,6 +29,7 @@ constexpr DeviceInfo Devices[] =
     { "0x389", "SmartShunt 500A/50mV", DeviceCategory::BatteryMonitor },
     { "0x38A", "SmartShunt 1000A/50mV", DeviceCategory::BatteryMonitor },
     { "0x38B", "SmartShunt 2000A/50mV", DeviceCategory::BatteryMonitor },
+    { "0xC035","SmartShunt 500A/50mV", DeviceCategory::BatteryMonitor },    // sendet mein SmartShunt
 
     // Orion XS
     { "0x3F0", "Orion XS 12V/12V-50A", DeviceCategory::DcDcCharger },

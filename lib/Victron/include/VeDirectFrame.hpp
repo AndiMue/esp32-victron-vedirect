@@ -31,6 +31,8 @@ struct VeDirectFrame
         fieldCount = 0;
         checksum = 0;
         checksumValid = false;
+        
+        fields = {};    // löscht alle Daten des Frames (Stichwort: PID bleibt im Speicher, Historienframe triggert Ausgabe des alten Speichers)
     }
 
     /**************************************************************************

@@ -9,8 +9,9 @@
 | `VeDirectFrame`      | Ein vollständiges VE.Direct-Telegramm repräsentieren          | Entscheidungen treffen   |
 | `FieldCatalog`       | VE.Direct-Felder beschreiben (Name, Typ, Einheit, Skalierung) | Daten speichern          |
 | `ValueConverter`     | Rohdaten in physikalische Werte umwandeln                     | UART oder Parser kennen  |
-| `FieldInterpreter`   | Daten menschenlesbar darstellen                               | Umrechnungen durchführen |
+| `FieldInterpreter`   | Felder menschenlesbar darstellen                              | Umrechnungen durchführen |
 | `DeviceCatalog`      | Geräte anhand der Product-ID identifizieren                   | Zustände speichern       |
+| `DeviceInterpreter`  | Geräteinformationen menschenlesbar darstellen                 | Gerätelogik enthalten    |
 | `StateMerger`        | Datenquellen zum `SystemState` zusammenführen                 | UART lesen               |
 | `SystemState`        | Aktuellen Anlagenzustand bereitstellen                        | Geräte kennen            |
 | `Diagnostics`        | Status, Warnungen und Fehler verwalten                        | Relais schalten          |
@@ -33,6 +34,11 @@ VeDirectTextParser
   │
   ▼
 VeDirectFrame
+  │
+  ├─────────────► DeviceCatalog
+  │                    │
+  │                    ▼
+  │              DeviceInterpreter
   │
   ▼
 FieldCatalog
@@ -57,43 +63,53 @@ Serial Monitor
 * FieldCatalog
 * ValueConverter
 * OffReason-Dekodierung
+* DeviceCatalog
+* DeviceInterpreter
+* Product-ID-Erkennung
+* SmartSolar-Unterstützung
+* SmartShunt-Unterstützung
 * Menschenlesbare Konsolenausgabe
 
 ---
 
 ## Geplante Ausbaustufen
 
-### M5 – DeviceCatalog
-
-* Product-ID erkennen
-* Gerätetyp bestimmen
-* MPPT, SmartShunt, Orion unterscheiden
-
-### M6 – SystemState
+### M5 – SystemState
 
 * Gemeinsamer Anlagenzustand
 * Entkopplung von Geräteprotokollen
 * Zentrale Datenbasis
 
-### M7 – Diagnostics
+### M6 – Diagnostics
 
 * Timeouts
 * Kommunikationsfehler
 * Checksum-Prüfung
 * Ereignisspeicher
 
-### M8 – RuleEngine
+### M7 – RuleEngine
 
 * SOC-basierte Entscheidungen
 * Lastabwurf
 * Nachteinspeisung sperren
 * Camper-Verbrauch reduzieren
 
-### M9 – MQTT / Visualisierung
+### M8 – MQTT / Visualisierung
 
 * MQTT Publisher
 * Home Assistant
 * Dashboard
 
-```
-```
+---
+
+## Spätere Erweiterungen
+
+### VE.Direct Completion
+
+* Vollständige Product-ID-Tabelle
+* Vollständige Charger-State-Dekodierung
+* Vollständige MPPT-State-Dekodierung
+* Vollständige Error-Code-Dekodierung
+* Vollständige Off-Reason-Dekodierung
+* Hex-Protokoll-Unterstützung
+* Erweiterte SmartShunt-Felder
