@@ -2,6 +2,14 @@
  * @file VeDirectReader.cpp
  ******************************************************************************/
 
+/*
+ * Der Reader benötigt Arduino (HardwareSerial). In der PC-Testumgebung
+ * (env:native) gibt es kein Arduino; PlatformIO übersetzt aber alle Dateien
+ * der Bibliothek "Victron". Daher wird der Inhalt dort ausgeblendet.
+ * Auf dem ESP32 ist ARDUINO immer definiert -> keine Änderung des Verhaltens.
+ */
+#ifdef ARDUINO
+
 #include "VeDirectReader.hpp"
 
 /******************************************************************************
@@ -59,3 +67,4 @@ void VeDirectReader::flush()
         m_serial.read();
     }
 }
+#endif // ARDUINO
