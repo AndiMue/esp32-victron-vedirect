@@ -69,7 +69,16 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
    - Reader, Pins und DeviceCatalog bleiben unverändert.
    - PC-Tests: `native`-Umgebung in `platformio.ini` (Unity), mit aussagekräftigen Kommentaren.
    - PC-Tests: GCC 16.2.0 aus MSYS2 (`C:\msys64\ucrt64\bin`, im Benutzer-Path); `pio test -e native` läuft.
-2. Geräteerkennung pro Kanal (**noch offen**, Reihenfolge mit Stufe 3 getauscht): `Unbekannt` → `Erkannt` durch gültigen Block mit PID; Blöcke ohne PID erben die Kanalerkennung; Rücksetzen bei Timeout (> ca. 3 s) oder PID-Wechsel. Bisher nur vorläufig in der Logger-Task gelöst (letzte PID je Kanal für den Gerätenamen im Blockkopf).
+2. **(umgesetzt und getestet 05.11.2026, nach Stufe 3)** Geräteerkennung pro Kanal (`DeviceDetector`):
+   - `Unbekannt` → `Erkannt` durch gültigen Block mit PID. Eine unbekannte PID gilt als „unbekanntes Gerät (0x…)“; ihre Felder werden trotzdem über den FieldCatalog umgerechnet.
+   - Blöcke ohne PID (H-Block) werden **nur einem Batteriemonitor** zugeordnet, sonst sind sie „nicht zuordenbar“ (Entscheidung des Projektinhabers).
+   - Timeout **5 s** ohne Block mit PID → „Gerät verloren“. Bei PID-Wechsel sofort „Gerätewechsel“.
+   - Diagnose für Wackelkontakte/Kabelbruch: Zähler für Ausfälle und Dauer des letzten Ausfalls; in der Statuszeile sichtbar.
+   - Timeout steht in `include/AppConfig.hpp` (`g_config.deviceTimeoutMs`, `std::atomic`) und ist später per WebUI/MQTT änderbar. NVS-Speicherung kommt mit der WebUI.
+   - Neu: `TextUtil.hpp` (gemeinsamer Vergleich ohne Groß-/Kleinschreibung).
+   - Testergebnis: 40/40 Unit-Tests auf PC und ESP32 (davon 14 für den Detektor). Hardware: Shunt (UART1) und Simulator (UART2) sofort erkannt, H-Block korrekt zugeordnet, 0 Fehler.
+   - **Noch nicht auf Hardware getestet:** „Gerät verloren“ (Stecker ziehen) und „Gerätewechsel“ (Geräte zwischen den UARTs tauschen).
+   - Hinweis: In der Bash-Shell von Claude Code läuft der MSYS2-GCC nur mit `C:\msys64\ucrt64\bin` am Anfang des PATH (Git-eigene DLLs stören). In PowerShell und im PlatformIO-Terminal tritt das nicht auf.
 3. **(umgesetzt und getestet 05.11.2026)** Klarnamen und physikalische Werte:
    - Neu: `FieldCatalog` (alle Felder von BMV-71x/SmartShunt und SmartSolar laut Doku 3.34; deutsche Klarnamen, Einheiten, Codetabellen CS/ERR/MPPT/MON, Bitmasken AR/OR/CAP_BLE), `ValueConverter` (Rohtext → `MeasuredValue` mit Status), `ValueFormatter` (Text mit Dezimalkomma, exakt aus dem Ganzzahlwert).
    - Überarbeitet: `SemanticField`, `FieldDefinition`, `MeasuredValue`.

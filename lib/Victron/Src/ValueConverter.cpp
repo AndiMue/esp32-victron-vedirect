@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "FieldCatalog.hpp"
+#include "TextUtil.hpp"
 
 namespace
 {
@@ -106,24 +107,6 @@ bool parseHex(const char* text, int64_t& result)
 
     result = value;
     return true;
-}
-
-/// Vergleich ohne Beachtung der Groß-/Kleinschreibung (Doku empfiehlt das
-/// für ON/OFF, da alte BMV "On"/"Off" senden).
-bool equalsIgnoreCase(const char* a, const char* b)
-{
-    for (; *a != '\0' && *b != '\0'; ++a, ++b)
-    {
-        char ca = *a;
-        char cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 'a' + 'A');
-        if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 'a' + 'A');
-        if (ca != cb)
-        {
-            return false;
-        }
-    }
-    return *a == '\0' && *b == '\0';
 }
 
 /******************************************************************************
@@ -244,8 +227,10 @@ MeasuredValue ValueConverter::convert(const char* label, const char* value)
             break;
 
         case ValueType::OnOff:
-            if (equalsIgnoreCase(value, "ON"))       { raw = 1; ok = true; }
-            else if (equalsIgnoreCase(value, "OFF")) { raw = 0; ok = true; }
+            // Doku empfiehlt Vergleich ohne Groß-/Kleinschreibung,
+            // da alte BMV "On"/"Off" senden.
+            if (TextUtil::equalsIgnoreCase(value, "ON"))       { raw = 1; ok = true; }
+            else if (TextUtil::equalsIgnoreCase(value, "OFF")) { raw = 0; ok = true; }
             break;
 
         case ValueType::Firmware:

@@ -1,23 +1,25 @@
 /******************************************************************************
  * @file main.cpp
  *
- * ESP32 Victron VE.Direct – Stufe 1: prüfsummengesicherter Rohdatenempfang
+ * ESP32 Victron VE.Direct
+ *   Stufe 1: prüfsummengesicherter Empfang
+ *   Stufe 2: Geräteerkennung pro Kanal (DeviceDetector)
+ *   Stufe 3: Klarnamen und physikalische Werte
  *
  * Aufbau (FreeRTOS-Tasks):
  *
- *   UART1 ─► VeDirectReader ─► VeDirectTextParser ─┐   uartTask (Core 0)
- *                                                    ├─► Queue ─► loggerTask ─► Serial (UART0)
- *   UART2 ─► VeDirectReader ─► VeDirectTextParser ─┘   uartTask (Core 1)
+ *   UART1 ─► Reader ─► Parser ─► DeviceDetector ─┐   uartTask (Core 0)
+ *                                                  ├─► Queue ─► loggerTask ─► Serial (UART0)
+ *   UART2 ─► Reader ─► Parser ─► DeviceDetector ─┘   uartTask (Core 1)
  *
  * Grundregeln:
  *   - NUR die loggerTask schreibt auf Serial (UART0). Die UART-Tasks geben
  *     nie selbst etwas aus. So können sich die Ausgaben beider Kanäle nicht
- *     mehr Zeichen für Zeichen vermischen, und eine blockierende
- *     Debug-Ausgabe bremst den VE.Direct-Empfang nicht aus.
- *   - Ausgegeben werden ausschließlich Blöcke mit gültiger Prüfsumme,
- *     als Rohtext (Label = Wert). Interpretation folgt in späteren Stufen.
+ *     vermischen, und eine blockierende Debug-Ausgabe bremst den
+ *     VE.Direct-Empfang nicht aus.
+ *   - Ausgegeben werden ausschließlich Blöcke mit gültiger Prüfsumme.
  *   - Die Kanäle heißen bewusst "UART1"/"UART2" und nicht "MPPT"/"Shunt":
- *     Später soll jedes Gerät an jedem UART funktionieren (Erkennung per PID).
+ *     Jedes Gerät funktioniert an jedem UART, die Erkennung erfolgt per PID.
  *
  * Pinbelegung (bestätigt):
  *   UART1: RX GPIO16, TX GPIO17
@@ -26,29 +28,33 @@
 
 #include <Arduino.h>
 
-#include <cstring>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "AppConfig.hpp"
 #include "DeviceCatalog.hpp"
+#include "DeviceDetector.hpp"
 #include "ValueConverter.hpp"
 #include "ValueFormatter.hpp"
 #include "VeDirectFrame.hpp"
 #include "VeDirectReader.hpp"
 #include "VeDirectTextParser.hpp"
 
+/******************************************************************************
+ * Zentrale Einstellungen (siehe AppConfig.hpp). Später per WebUI änderbar.
+ ******************************************************************************/
+AppConfig g_config;
+
 namespace
 {
 
 /******************************************************************************
- * Einstellungen
+ * Feste Einstellungen
  ******************************************************************************/
 constexpr uint32_t DebugBaudrate     = 115200; ///< UART0 / USB-Monitor
 constexpr uint32_t StatusIntervalMs  = 5000;   ///< Statuszeile alle 5 s
-constexpr uint32_t ChannelTimeoutMs  = 3000;   ///< ohne gültigen Block -> Warnung
-constexpr UBaseType_t LogQueueLength = 6;      ///< Puffer für Logger-Nachrichten
+constexpr UBaseType_t LogQueueLength = 8;      ///< Puffer für Logger-Nachrichten
 
 constexpr uint32_t UartTaskStack   = 4096;
 constexpr uint32_t LoggerTaskStack = 6144;   ///< printf/snprintf mit Formatierung braucht etwas mehr
@@ -69,7 +75,9 @@ constexpr UBaseType_t LoggerTaskPriority = 1;
  ******************************************************************************/
 struct ChannelStatus
 {
-    VeDirectTextParser::Statistics parser;   ///< Zähler des Parsers
+    VeDirectTextParser::Statistics parser;    ///< Zähler des Parsers
+    DeviceDetector::Identity       device;    ///< aktuell erkanntes Gerät
+    DeviceDetector::Statistics     detector;  ///< Erkennungen, Ausfälle ...
     uint32_t lastValidFrameMs = 0;            ///< millis() des letzten gültigen Blocks
     bool     hasValidFrame    = false;        ///< mindestens ein gültiger Block?
     uint32_t queueDrops       = 0;            ///< Nachrichten verloren (Queue voll)
@@ -80,22 +88,27 @@ struct ChannelStatus
  ******************************************************************************/
 enum class LogKind : uint8_t
 {
-    Frame,          ///< gültiger Block, "frame" ist gefüllt
-    ChecksumError,  ///< Block mit falscher Prüfsumme verworfen
-    FrameDiscarded  ///< Block mit Format-/Größenfehler verworfen
+    Frame,            ///< gültiger Block, "frame" und "origin" sind gefüllt
+    ChecksumError,    ///< Block mit falscher Prüfsumme verworfen
+    FrameDiscarded,   ///< Block mit Format-/Größenfehler verworfen
+    DeviceIdentified, ///< Gerät erkannt (erstmals oder nach Ausfall)
+    DeviceChanged,    ///< anderes Gerät am Kanal ("previousDevice" = altes)
+    DeviceLost        ///< Timeout ("previousDevice" = verlorenes Gerät)
 };
 
 struct LogMessage
 {
-    LogKind       kind = LogKind::Frame;
-    uint8_t       channelIndex = 0;
-    uint32_t      timestampMs = 0;
-    ChannelStatus status;          ///< Zählerstand zum Zeitpunkt der Nachricht
-    VeDirectFrame frame;           ///< nur bei LogKind::Frame gültig
+    LogKind                  kind = LogKind::Frame;
+    uint8_t                  channelIndex = 0;
+    uint32_t                 timestampMs = 0;
+    ChannelStatus            status;          ///< Stand zum Zeitpunkt der Nachricht
+    DeviceDetector::Origin   origin = DeviceDetector::Origin::Unassigned;
+    DeviceDetector::Identity previousDevice;  ///< nur bei DeviceChanged/DeviceLost
+    VeDirectFrame            frame;           ///< nur bei LogKind::Frame gültig
 };
 
 /******************************************************************************
- * Ein VE.Direct-Kanal: UART + eigener Parser + eigener Status.
+ * Ein VE.Direct-Kanal: UART + Parser + Geräteerkennung + Status.
  ******************************************************************************/
 struct Channel
 {
@@ -109,9 +122,10 @@ struct Channel
     const char* const   name;
     VeDirectReader      reader;
     VeDirectTextParser  parser;     ///< nur von der eigenen UART-Task benutzt
+    DeviceDetector      detector;   ///< nur von der eigenen UART-Task benutzt
     ChannelStatus       status;     ///< geschützt durch g_statusLock
     LogMessage          outgoing;   ///< Sendepuffer der UART-Task
-                                    ///< (global statt auf dem Stack, ~1,7 KB)
+                                    ///< (global statt auf dem Stack, ~1,8 KB)
 };
 
 /******************************************************************************
@@ -148,7 +162,64 @@ ChannelStatus readStatus(const Channel& channel)
 }
 
 /******************************************************************************
- * UART-Task: Bytes lesen, parsen, Ergebnisse an den Logger melden.
+ * Status aktualisieren und eine Nachricht an den Logger senden.
+ *
+ * Nicht blockierend: Ist die Queue voll, wird die Nachricht verworfen und
+ * gezählt. Der Empfang darf nie wegen der Ausgabe stocken.
+ * Nur aus der UART-Task des Kanals aufrufen.
+ ******************************************************************************/
+void publish(Channel& channel, LogKind kind, uint32_t now,
+             DeviceDetector::Origin origin = DeviceDetector::Origin::Unassigned,
+             const VeDirectFrame* frame = nullptr)
+{
+    portENTER_CRITICAL(&g_statusLock);
+    channel.status.parser   = channel.parser.statistics();
+    channel.status.device   = channel.detector.identity();
+    channel.status.detector = channel.detector.statistics();
+    if (kind == LogKind::Frame)
+    {
+        channel.status.lastValidFrameMs = now;
+        channel.status.hasValidFrame    = true;
+    }
+    const ChannelStatus snapshot = channel.status;
+    portEXIT_CRITICAL(&g_statusLock);
+
+    LogMessage& msg   = channel.outgoing;
+    msg.kind           = kind;
+    msg.channelIndex   = channel.index;
+    msg.timestampMs    = now;
+    msg.status         = snapshot;
+    msg.origin         = origin;
+    msg.previousDevice = channel.detector.previousIdentity();
+
+    if (frame != nullptr)
+    {
+        msg.frame = *frame;
+    }
+    else
+    {
+        msg.frame.clear();
+    }
+
+    if (xQueueSend(g_logQueue, &msg, 0) != pdTRUE)
+    {
+        portENTER_CRITICAL(&g_statusLock);
+        ++channel.status.queueDrops;
+        portEXIT_CRITICAL(&g_statusLock);
+    }
+}
+
+/// Geräteausfall prüfen und ggf. melden.
+void checkDeviceTimeout(Channel& channel, uint32_t now)
+{
+    if (channel.detector.checkTimeout(now) == DeviceDetector::Event::Lost)
+    {
+        publish(channel, LogKind::DeviceLost, now);
+    }
+}
+
+/******************************************************************************
+ * UART-Task: Bytes lesen, parsen, Gerät erkennen, Ergebnisse melden.
  *
  * Gibt selbst NICHTS auf Serial aus.
  ******************************************************************************/
@@ -158,6 +229,14 @@ void uartTask(void* parameter)
 
     for (;;)
     {
+        // Timeout laufend aus der Konfiguration übernehmen
+        // (kann später z. B. über die WebUI geändert werden).
+        channel.detector.setTimeoutMs(g_config.deviceTimeoutMs.load());
+
+        // Ausfall auch dann erkennen, wenn gar keine Bytes mehr kommen
+        // (z. B. Stecker abgezogen, Kabelbruch).
+        checkDeviceTimeout(channel, millis());
+
         while (channel.reader.available())
         {
             const uint8_t byte = static_cast<uint8_t>(channel.reader.read());
@@ -170,46 +249,36 @@ void uartTask(void* parameter)
 
             const uint32_t now = millis();
 
-            // Status aktualisieren (Zähler des Parsers + Zeitstempel)
-            portENTER_CRITICAL(&g_statusLock);
-            channel.status.parser = channel.parser.statistics();
-            if (event == VeDirectTextParser::Event::FrameReady)
-            {
-                channel.status.lastValidFrameMs = now;
-                channel.status.hasValidFrame    = true;
-            }
-            const ChannelStatus snapshot = channel.status;
-            portEXIT_CRITICAL(&g_statusLock);
-
-            // Nachricht für den Logger vorbereiten
-            LogMessage& msg = channel.outgoing;
-            msg.channelIndex = channel.index;
-            msg.timestampMs  = now;
-            msg.status       = snapshot;
-
             switch (event)
             {
                 case VeDirectTextParser::Event::FrameReady:
-                    msg.kind  = LogKind::Frame;
-                    msg.frame = channel.parser.frame();
-                    break;
-                case VeDirectTextParser::Event::ChecksumError:
-                    msg.kind = LogKind::ChecksumError;
-                    msg.frame.clear();
-                    break;
-                default:
-                    msg.kind = LogKind::FrameDiscarded;
-                    msg.frame.clear();
-                    break;
-            }
+                {
+                    checkDeviceTimeout(channel, now);   // vor update(), siehe DeviceDetector
 
-            // Nicht warten: Ist die Queue voll, wird die Nachricht verworfen
-            // und gezählt. Der Empfang darf nie wegen der Ausgabe stocken.
-            if (xQueueSend(g_logQueue, &msg, 0) != pdTRUE)
-            {
-                portENTER_CRITICAL(&g_statusLock);
-                ++channel.status.queueDrops;
-                portEXIT_CRITICAL(&g_statusLock);
+                    const VeDirectFrame& frame = channel.parser.frame();
+                    const DeviceDetector::Result result = channel.detector.update(frame, now);
+
+                    // Erst das Ereignis, dann den Block melden
+                    if (result.event == DeviceDetector::Event::Identified)
+                    {
+                        publish(channel, LogKind::DeviceIdentified, now);
+                    }
+                    else if (result.event == DeviceDetector::Event::Changed)
+                    {
+                        publish(channel, LogKind::DeviceChanged, now);
+                    }
+
+                    publish(channel, LogKind::Frame, now, result.origin, &frame);
+                    break;
+                }
+
+                case VeDirectTextParser::Event::ChecksumError:
+                    publish(channel, LogKind::ChecksumError, now);
+                    break;
+
+                default:
+                    publish(channel, LogKind::FrameDiscarded, now);
+                    break;
             }
         }
 
@@ -229,6 +298,35 @@ void printTimestamp(uint32_t ms)
     Serial.printf("%6lu.%03lus",
                   static_cast<unsigned long>(ms / 1000),
                   static_cast<unsigned long>(ms % 1000));
+}
+
+/// Dauer in Sekunden mit einer Nachkommastelle, z. B. "7,2 s".
+void printSeconds(uint32_t ms)
+{
+    Serial.printf("%lu,%lu s",
+                  static_cast<unsigned long>(ms / 1000),
+                  static_cast<unsigned long>((ms % 1000) / 100));
+}
+
+/// Kanalname und Zeitstempel am Zeilenanfang.
+void printLinePrefix(const LogMessage& msg)
+{
+    Serial.printf("[%s] ", g_channels[msg.channelIndex].name);
+    printTimestamp(msg.timestampMs);
+    Serial.print("  ");
+}
+
+/// Gerät ausgeben: "SmartShunt 500A/50mV (0xC035)" bzw. "unbekanntes Gerät (0x1234)".
+void printDevice(const DeviceDetector::Identity& device)
+{
+    if (device.state != DeviceDetector::State::Identified)
+    {
+        Serial.print("kein Gerät erkannt");
+        return;
+    }
+    Serial.printf("%s (%s)",
+                  device.device != nullptr ? device.device->name : "unbekanntes Gerät",
+                  device.productId);
 }
 
 /// Wert ausgeben; nicht druckbare Zeichen erscheinen als <0xNN>.
@@ -280,44 +378,36 @@ void printPadded(const char* text, size_t width)
 }
 
 /******************************************************************************
- * Gerätename je Kanal (vorläufig, bis zur Geräteerkennung in Stufe 2).
- *
- * Blöcke mit PID legen das Gerät des Kanals fest. Blöcke ohne PID (z. B.
- * der H-Block des SmartShunts) werden dem zuletzt erkannten Gerät des
- * Kanals zugeordnet und im Kopf als "Folgeblock" gekennzeichnet.
- * Nur von der Logger-Task verwendet.
+ * Kopfzeile eines Blocks: Kanal, Zeit, Herkunft/Gerät, Zähler.
  ******************************************************************************/
-char g_lastProductId[ChannelCount][VeDirectField::ValueSize] = {};
-
-/// Kopfzeile eines Blocks: Kanal, Zeit, Gerät, Zähler.
 void printFrameHeader(const LogMessage& msg)
 {
-    const Channel& channel = g_channels[msg.channelIndex];
-    char* lastPid = g_lastProductId[msg.channelIndex];
+    printLinePrefix(msg);
 
-    const VeDirectField* pidField = msg.frame.find("PID");
-    if (pidField != nullptr)
+    switch (msg.origin)
     {
-        std::strncpy(lastPid, pidField->value.data(), VeDirectField::ValueSize - 1);
-        lastPid[VeDirectField::ValueSize - 1] = '\0';
-    }
+        case DeviceDetector::Origin::Own:
+            printDevice(msg.status.device);
+            break;
 
-    Serial.printf("[%s] ", channel.name);
-    printTimestamp(msg.timestampMs);
-    Serial.print("  ");
-
-    if (lastPid[0] == '\0')
-    {
-        Serial.print("Gerät unbekannt (noch keine PID empfangen)");
-    }
-    else
-    {
-        const DeviceInfo* device = DeviceCatalog::find(lastPid);
-        Serial.printf("%s (%s)", device != nullptr ? device->name : "unbekanntes Gerät", lastPid);
-        if (pidField == nullptr)
-        {
+        case DeviceDetector::Origin::Inherited:
+            printDevice(msg.status.device);
             Serial.print(" - Folgeblock ohne PID");
-        }
+            break;
+
+        case DeviceDetector::Origin::Unassigned:
+            Serial.print("nicht zuordenbarer Block ohne PID");
+            if (msg.status.device.state == DeviceDetector::State::Identified)
+            {
+                Serial.print(" (Kanalgerät ");
+                printDevice(msg.status.device);
+                Serial.print(" ist kein Batteriemonitor)");
+            }
+            else
+            {
+                Serial.print(" (noch kein Gerät erkannt)");
+            }
+            break;
     }
 
     Serial.printf("  |  Block #%lu OK  Felder=%u  Pruefsumme=0x%02X\n",
@@ -357,20 +447,63 @@ void printFrame(const LogMessage& msg)
 /// Verworfenen Block melden (Inhalt wird nicht ausgegeben).
 void printError(const LogMessage& msg)
 {
-    const Channel& channel = g_channels[msg.channelIndex];
-
-    Serial.printf("[%s] ", channel.name);
-    printTimestamp(msg.timestampMs);
+    printLinePrefix(msg);
 
     if (msg.kind == LogKind::ChecksumError)
     {
-        Serial.printf("  !! Pruefsummenfehler, Block verworfen (gesamt: %lu)\n",
+        Serial.printf("!! Pruefsummenfehler, Block verworfen (gesamt: %lu)\n",
                       static_cast<unsigned long>(msg.status.parser.checksumErrors));
     }
     else
     {
-        Serial.printf("  !! Formatfehler (zu lang/zu viele Felder), Block verworfen (gesamt: %lu)\n",
+        Serial.printf("!! Formatfehler (zu lang/zu viele Felder), Block verworfen (gesamt: %lu)\n",
                       static_cast<unsigned long>(msg.status.parser.framesDiscarded));
+    }
+}
+
+/// Ereignis der Geräteerkennung melden.
+void printDeviceEvent(const LogMessage& msg)
+{
+    const DeviceDetector::Statistics& stats = msg.status.detector;
+
+    printLinePrefix(msg);
+
+    switch (msg.kind)
+    {
+        case LogKind::DeviceIdentified:
+            Serial.print(">> Gerät erkannt: ");
+            printDevice(msg.status.device);
+            if (stats.lostCount > 0)
+            {
+                // Wiedererkennung: Dauer des Ausfalls hilft bei der Suche
+                // nach Wackelkontakten.
+                Serial.print("  (wieder da nach Ausfall von ");
+                printSeconds(stats.lastOutageMs);
+                Serial.printf(", Ausfälle gesamt: %lu)",
+                              static_cast<unsigned long>(stats.lostCount));
+            }
+            Serial.println();
+            break;
+
+        case LogKind::DeviceChanged:
+            Serial.print(">> Gerätewechsel: ");
+            printDevice(msg.previousDevice);
+            Serial.print("  ->  ");
+            printDevice(msg.status.device);
+            Serial.println();
+            break;
+
+        case LogKind::DeviceLost:
+            Serial.print("!! Gerät verloren: ");
+            printDevice(msg.previousDevice);
+            Serial.print("  (seit mehr als ");
+            printSeconds(g_config.deviceTimeoutMs.load());
+            Serial.printf(" kein Block mit PID, Ausfälle gesamt: %lu)\n",
+                          static_cast<unsigned long>(stats.lostCount));
+            break;
+
+        default:
+            break;
     }
 }
 
@@ -384,30 +517,27 @@ void printStatusReport()
         const Channel&      channel = g_channels[i];
         const ChannelStatus status  = readStatus(channel);
 
-        Serial.printf("[STATUS] %s: OK=%lu  Pruefsummenfehler=%lu  Verworfen=%lu  "
-                      "HEX=%lu  Queue-Verluste=%lu  ",
-                      channel.name,
+        Serial.printf("[STATUS] %s: ", channel.name);
+        printDevice(status.device);
+
+        Serial.printf("  OK=%lu  Pruefsummenfehler=%lu  Verworfen=%lu  HEX=%lu  "
+                      "Ausfälle=%lu  nicht zuordenbar=%lu  Queue-Verluste=%lu  ",
                       static_cast<unsigned long>(status.parser.framesOk),
                       static_cast<unsigned long>(status.parser.checksumErrors),
                       static_cast<unsigned long>(status.parser.framesDiscarded),
                       static_cast<unsigned long>(status.parser.hexMessagesSkipped),
+                      static_cast<unsigned long>(status.detector.lostCount),
+                      static_cast<unsigned long>(status.detector.unassignedFrames),
                       static_cast<unsigned long>(status.queueDrops));
 
         if (!status.hasValidFrame)
         {
-            Serial.println("** noch kein gueltiger Block seit Start **");
+            Serial.println("** noch kein gültiger Block seit Start **");
             continue;
         }
 
-        const uint32_t age = now - status.lastValidFrameMs;
-        Serial.printf("letzter gueltiger Block vor %lu ms",
-                      static_cast<unsigned long>(age));
-
-        if (age > ChannelTimeoutMs)
-        {
-            Serial.print("  ** KEINE DATEN (Timeout) **");
-        }
-        Serial.println();
+        Serial.printf("letzter gültiger Block vor %lu ms\n",
+                      static_cast<unsigned long>(now - status.lastValidFrameMs));
     }
 }
 
@@ -424,13 +554,22 @@ void loggerTask(void*)
         // wenn kein Kanal Daten liefert.
         if (xQueueReceive(g_logQueue, &g_incoming, pdMS_TO_TICKS(250)) == pdTRUE)
         {
-            if (g_incoming.kind == LogKind::Frame)
+            switch (g_incoming.kind)
             {
-                printFrame(g_incoming);
-            }
-            else
-            {
-                printError(g_incoming);
+                case LogKind::Frame:
+                    printFrame(g_incoming);
+                    break;
+
+                case LogKind::ChecksumError:
+                case LogKind::FrameDiscarded:
+                    printError(g_incoming);
+                    break;
+
+                case LogKind::DeviceIdentified:
+                case LogKind::DeviceChanged:
+                case LogKind::DeviceLost:
+                    printDeviceEvent(g_incoming);
+                    break;
             }
         }
 
@@ -457,8 +596,10 @@ void setup()
 
     Serial.println();
     Serial.println("--------------------------------------------------");
-    Serial.println("Victron VE.Direct Reader - Stufe 3 (Klarnamen, umgerechnete Werte)");
+    Serial.println("Victron VE.Direct Reader - Stufe 2+3 (Geräteerkennung, Klarnamen)");
     Serial.println("UART1: RX 16 / TX 17    UART2: RX 26 / TX 33");
+    Serial.printf("Geräte-Timeout: %lu ms\n",
+                  static_cast<unsigned long>(g_config.deviceTimeoutMs.load()));
     Serial.printf("sizeof(VeDirectFrame) = %u Byte, sizeof(LogMessage) = %u Byte\n",
                   static_cast<unsigned>(sizeof(VeDirectFrame)),
                   static_cast<unsigned>(sizeof(LogMessage)));

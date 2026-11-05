@@ -12,6 +12,8 @@
 
 #include <cstddef>
 
+#include "TextUtil.hpp"
+
 namespace
 {
 
@@ -61,23 +63,6 @@ const DeviceInfo Devices[] =
 
 constexpr std::size_t DeviceCount = sizeof(Devices) / sizeof(Devices[0]);
 
-/// Vergleich ohne Groß-/Kleinschreibung ("0xa057" == "0xA057").
-bool equalsIgnoreCase(const char* a, const char* b)
-{
-    for (; *a != '\0' && *b != '\0'; ++a, ++b)
-    {
-        char ca = *a;
-        char cb = *b;
-        if (ca >= 'a' && ca <= 'z') ca = static_cast<char>(ca - 'a' + 'A');
-        if (cb >= 'a' && cb <= 'z') cb = static_cast<char>(cb - 'a' + 'A');
-        if (ca != cb)
-        {
-            return false;
-        }
-    }
-    return *a == '\0' && *b == '\0';
-}
-
 } // namespace
 
 /******************************************************************************
@@ -92,7 +77,8 @@ const DeviceInfo* DeviceCatalog::find(const char* productId)
 
     for (std::size_t i = 0; i < DeviceCount; ++i)
     {
-        if (equalsIgnoreCase(Devices[i].productId, productId))
+        // Groß-/Kleinschreibung egal: "0xa057" == "0xA057"
+        if (TextUtil::equalsIgnoreCase(Devices[i].productId, productId))
         {
             return &Devices[i];
         }
