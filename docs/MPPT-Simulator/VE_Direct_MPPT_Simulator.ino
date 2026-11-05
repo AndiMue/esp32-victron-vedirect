@@ -51,7 +51,7 @@ static void sendMpptFrame() {
   appendField(packet, "OR",    "0x00000001");       // Off reason
   appendField(packet, "ERR",   "0");               // No error
   appendField(packet, "LOAD",  "OFF");             // Load output state
-  appendField(packet, "IL",    "0");               // Load current, A
+  appendField(packet, "IL",    "0");               // Load current, mA
   appendField(packet, "H19",   String((frameCounter * ppv) / 36000UL)); // Yield total, 0.01 kWh units
   appendField(packet, "H20",   "0");               // Yield today, 0.01 kWh units
   appendField(packet, "H21",   String(ppv));        // Maximum power today, W

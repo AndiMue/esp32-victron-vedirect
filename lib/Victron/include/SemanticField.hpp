@@ -1,10 +1,13 @@
 /******************************************************************************
  * @file SemanticField.hpp
  *
- * Semantische Bedeutung eines VE.Direct-Feldes.
+ * Fachliche Bedeutung eines VE.Direct-Feldes.
  *
- * Diese Enum ist unabhängig vom eigentlichen Label ("V", "I", "H19"...)
- * und beschreibt ausschließlich die fachliche Bedeutung.
+ * Unabhängig vom eigentlichen Label ("V", "I", "H19" ...). Spätere Schichten
+ * (Gerätezustand, Display, Relaislogik) arbeiten mit diesen Werten und
+ * müssen die VE.Direct-Kürzel nicht kennen.
+ *
+ * Die Zuordnung Label -> SemanticField steht im FieldCatalog.
  ******************************************************************************/
 
 #pragma once
@@ -15,69 +18,65 @@ enum class SemanticField : uint16_t
 {
     Unknown = 0,
 
-    ProductId,
-    FirmwareVersion,
-    SerialNumber,
+    // ---- Geräteinformationen ------------------------------------------------
+    ProductId,              ///< PID
+    FirmwareVersion,        ///< FW
+    FirmwareVersionExt,     ///< FWE (24 Bit)
+    SerialNumber,           ///< SER#
+    ModelDescription,       ///< BMV (veraltet)
 
-    BatteryVoltage,
-    BatteryCurrent,
+    // ---- Batterie (Shunt und MPPT) -------------------------------------------
+    BatteryVoltage,         ///< V
+    BatteryCurrent,         ///< I
+    BatteryPower,           ///< P
+    BatteryTemperature,     ///< T
+    AuxVoltage,             ///< VS  (Starterbatterie)
+    MidPointVoltage,        ///< VM
+    MidPointDeviation,      ///< DM
+    ConsumedAmpHours,       ///< CE
+    StateOfCharge,          ///< SOC
+    TimeToGo,               ///< TTG
 
-    PvVoltage,
-    PvPower,
+    // ---- Alarme / Relais ----------------------------------------------------
+    AlarmActive,            ///< Alarm
+    RelayState,             ///< Relay
+    AlarmReason,            ///< AR
+    MonitorMode,            ///< MON
 
-    ChargerState,
-    MpptState,
+    // ---- Historie Batteriemonitor (H1..H18) ---------------------------------
+    DepthDeepestDischarge,  ///< H1
+    DepthLastDischarge,     ///< H2
+    DepthAverageDischarge,  ///< H3
+    ChargeCycles,           ///< H4
+    FullDischarges,         ///< H5
+    CumulativeAmpHours,     ///< H6
+    MinimumBatteryVoltage,  ///< H7
+    MaximumBatteryVoltage,  ///< H8
+    SecondsSinceFullCharge, ///< H9
+    AutoSynchronizations,   ///< H10
+    LowVoltageAlarms,       ///< H11
+    HighVoltageAlarms,      ///< H12
+    LowAuxVoltageAlarms,    ///< H13
+    HighAuxVoltageAlarms,   ///< H14
+    MinimumAuxVoltage,      ///< H15
+    MaximumAuxVoltage,      ///< H16
+    DischargedEnergy,       ///< H17
+    ChargedEnergy,          ///< H18
 
-    RelayState,
-
-    ErrorCode,
-
-    OffReason, 
-    
-    YieldTotal,
-    YieldToday,
-    YieldYesterday,
-
-    MaximumPowerToday,
-    MaximumPowerYesterday,
-
-    DaySequence,
-
-    BatteryPower,
-
-    StateOfCharge,
-    TimeToGo,
-
-    AlarmState,
-    AlarmReason,
-
-    ConsumedAmpHours,
-
-    DepthDeepestDischarge,
-    DepthLastDischarge,
-    DepthAverageDischarge,
-
-    ChargeCycles,
-    FullDischarges,
-
-    CumulativeAmpHours,
-
-    MinimumBatteryVoltage,
-    MaximumBatteryVoltage,
-
-    SecondsSinceFullCharge,
-
-    AutoSynchronizations,
-
-    LowVoltageAlarms,
-    HighVoltageAlarms,
-
-    MinimumAuxVoltage,
-    MaximumAuxVoltage,
-
-    DischargedEnergy,
-    ChargedEnergy,
-
-    DeviceName,
-    MonitorMode
+    // ---- Solarladeregler ----------------------------------------------------
+    PvVoltage,              ///< VPV
+    PvPower,                ///< PPV
+    LoadCurrent,            ///< IL
+    LoadOutput,             ///< LOAD
+    ChargerState,           ///< CS
+    TrackerMode,            ///< MPPT
+    ErrorCode,              ///< ERR
+    OffReason,              ///< OR
+    BleCapabilities,        ///< CAP_BLE
+    YieldTotal,             ///< H19
+    YieldToday,             ///< H20
+    MaximumPowerToday,      ///< H21
+    YieldYesterday,         ///< H22
+    MaximumPowerYesterday,  ///< H23
+    DaySequence             ///< HSDS
 };

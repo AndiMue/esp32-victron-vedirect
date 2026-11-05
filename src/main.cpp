@@ -26,10 +26,15 @@
 
 #include <Arduino.h>
 
+#include <cstring>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "DeviceCatalog.hpp"
+#include "ValueConverter.hpp"
+#include "ValueFormatter.hpp"
 #include "VeDirectFrame.hpp"
 #include "VeDirectReader.hpp"
 #include "VeDirectTextParser.hpp"
@@ -46,7 +51,11 @@ constexpr uint32_t ChannelTimeoutMs  = 3000;   ///< ohne gültigen Block -> Warn
 constexpr UBaseType_t LogQueueLength = 6;      ///< Puffer für Logger-Nachrichten
 
 constexpr uint32_t UartTaskStack   = 4096;
-constexpr uint32_t LoggerTaskStack = 4096;
+constexpr uint32_t LoggerTaskStack = 6144;   ///< printf/snprintf mit Formatierung braucht etwas mehr
+
+/// Spaltenbreiten der Feldausgabe (in Zeichen, nicht Bytes – Umlaute!)
+constexpr size_t NameColumnWidth  = 34;
+constexpr size_t ValueColumnWidth = 32;
 
 /// UART-Tasks haben höhere Priorität als der Logger: Empfang geht vor Ausgabe.
 constexpr UBaseType_t UartTaskPriority   = 2;
@@ -239,22 +248,107 @@ void printRawValue(const char* value)
     }
 }
 
-/// Gültigen Block vollständig als Rohdaten ausgeben.
-void printFrame(const LogMessage& msg)
+/// Anzahl der Zeichen eines UTF-8-Texts (Umlaute zählen als 1 Zeichen).
+size_t utf8Length(const char* text)
+{
+    size_t count = 0;
+    for (const char* p = text; *p != '\0'; ++p)
+    {
+        // Folgebytes einer UTF-8-Sequenz haben das Muster 10xxxxxx
+        if ((static_cast<uint8_t>(*p) & 0xC0) != 0x80)
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+/// Text ausgeben und mit Leerzeichen auf "width" Zeichen auffüllen
+/// (mindestens ein Leerzeichen Abstand).
+void printPadded(const char* text, size_t width)
+{
+    Serial.print(text);
+    const size_t length = utf8Length(text);
+    for (size_t i = length; i < width; ++i)
+    {
+        Serial.write(' ');
+    }
+    if (length >= width)
+    {
+        Serial.write(' ');
+    }
+}
+
+/******************************************************************************
+ * Gerätename je Kanal (vorläufig, bis zur Geräteerkennung in Stufe 2).
+ *
+ * Blöcke mit PID legen das Gerät des Kanals fest. Blöcke ohne PID (z. B.
+ * der H-Block des SmartShunts) werden dem zuletzt erkannten Gerät des
+ * Kanals zugeordnet und im Kopf als "Folgeblock" gekennzeichnet.
+ * Nur von der Logger-Task verwendet.
+ ******************************************************************************/
+char g_lastProductId[ChannelCount][VeDirectField::ValueSize] = {};
+
+/// Kopfzeile eines Blocks: Kanal, Zeit, Gerät, Zähler.
+void printFrameHeader(const LogMessage& msg)
 {
     const Channel& channel = g_channels[msg.channelIndex];
+    char* lastPid = g_lastProductId[msg.channelIndex];
+
+    const VeDirectField* pidField = msg.frame.find("PID");
+    if (pidField != nullptr)
+    {
+        std::strncpy(lastPid, pidField->value.data(), VeDirectField::ValueSize - 1);
+        lastPid[VeDirectField::ValueSize - 1] = '\0';
+    }
 
     Serial.printf("[%s] ", channel.name);
     printTimestamp(msg.timestampMs);
-    Serial.printf("  Block #%lu OK  Felder=%u  Pruefsumme=0x%02X\n",
+    Serial.print("  ");
+
+    if (lastPid[0] == '\0')
+    {
+        Serial.print("Gerät unbekannt (noch keine PID empfangen)");
+    }
+    else
+    {
+        const DeviceInfo* device = DeviceCatalog::find(lastPid);
+        Serial.printf("%s (%s)", device != nullptr ? device->name : "unbekanntes Gerät", lastPid);
+        if (pidField == nullptr)
+        {
+            Serial.print(" - Folgeblock ohne PID");
+        }
+    }
+
+    Serial.printf("  |  Block #%lu OK  Felder=%u  Pruefsumme=0x%02X\n",
                   static_cast<unsigned long>(msg.status.parser.framesOk),
                   static_cast<unsigned>(msg.frame.fieldCount),
                   msg.frame.checksum);
+}
+
+/******************************************************************************
+ * Gültigen Block ausgeben, eine Zeile je Feld:
+ *
+ *   Klarname          umgerechneter Wert          Label = Rohwert
+ *   Batteriespannung  12,327 V                    V = 12327
+ ******************************************************************************/
+void printFrame(const LogMessage& msg)
+{
+    printFrameHeader(msg);
+
+    char text[ValueFormatter::BufferSize];
 
     for (size_t i = 0; i < msg.frame.fieldCount; ++i)
     {
         const VeDirectField& field = msg.frame.fields[i];
-        Serial.printf("    %-9s = ", field.label.data());
+        const MeasuredValue  value = ValueConverter::convert(field);
+
+        Serial.print("    ");
+        printPadded(ValueFormatter::name(value), NameColumnWidth);
+        printPadded(ValueFormatter::format(field, value, text, sizeof(text)),
+                    ValueColumnWidth);
+
+        Serial.printf("%s = ", field.label.data());
         printRawValue(field.value.data());
         Serial.println();
     }
@@ -363,7 +457,7 @@ void setup()
 
     Serial.println();
     Serial.println("--------------------------------------------------");
-    Serial.println("Victron VE.Direct Reader - Stufe 1 (Rohdaten, Pruefsumme)");
+    Serial.println("Victron VE.Direct Reader - Stufe 3 (Klarnamen, umgerechnete Werte)");
     Serial.println("UART1: RX 16 / TX 17    UART2: RX 26 / TX 33");
     Serial.printf("sizeof(VeDirectFrame) = %u Byte, sizeof(LogMessage) = %u Byte\n",
                   static_cast<unsigned>(sizeof(VeDirectFrame)),

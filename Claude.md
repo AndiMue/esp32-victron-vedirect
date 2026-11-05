@@ -33,7 +33,7 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 - Testergebnisse und technische Entscheidungen dokumentieren.
 - Keine Änderungen an der Hardwarekonfiguration ohne Rücksprache.
 
-## Aktueller Stand und nächste Schritte (Stand: 04.11.2026)
+## Aktueller Stand und nächste Schritte (Stand: 05.11.2026)
 
 ### Bestätigte Fakten (vom Projektinhaber)
 - UART1: RX GPIO16 / TX GPIO17. UART2: RX GPIO26 / **TX GPIO33** (der Code ist maßgeblich; die Angabe GPIO27 in `ESP32_Pinbelegung.xlsx` ist veraltet).
@@ -50,9 +50,9 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 - `---` (nicht synchronisiert) wurde per `atoi` zu 0 (z. B. SOC 0 %).
 - Aktueller Code: zwei Tasks schreiben gleichzeitig Byte für Byte auf `Serial`.
 
-### Bekannte Fehler (noch nicht behoben)
-- `DeviceCatalog.cpp`: BMV-71x/SmartShunt/Orion-PIDs ohne „A“ (`0x389` statt `0xA389` usw.), `0xA059` ist „150/100 rev2“.
-- Simulator sendet PID `0xA042` (= BlueSolar 75/15) statt `0xA057`. Laut Projektinhaber korrigiert (05.11.2026); die Datei im Repo unter `docs/MPPT-Simulator/` enthält aber noch `0xA042`.
+### Bekannte Fehler / Hinweise
+- Behoben 05.11.2026: PIDs im `DeviceCatalog.cpp` korrigiert (`0xA381`…, `0xA389`…, `0xA3F0`…), `0xC035` aufgenommen, `0xA059` = „150/100 rev2“, PID-Vergleich ohne Beachtung der Groß-/Kleinschreibung.
+- Simulator: PID und IL-Kommentar laut Projektinhaber korrigiert (05.11.2026). Im Simulator sind `OR = 0x00000001` („Keine Eingangsleistung“) und gleichzeitig `PPV > 0`/`CS = 3` widersprüchlich – nur Testdaten, kein Codefehler.
 - `test_Code/` ist ein abweichender, nicht kompilierbarer Entwurf (nicht Teil des Builds).
 
 ### Stufenplan
@@ -68,9 +68,14 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
    - Banner vor Taskstart, auskommentierte Altblöcke in `main.cpp` entfernen.
    - Reader, Pins und DeviceCatalog bleiben unverändert.
    - PC-Tests: `native`-Umgebung in `platformio.ini` (Unity), mit aussagekräftigen Kommentaren.
-   - **Blocker:** Auf dem PC ist kein GCC installiert (geprüft 04.11.2026). Vor jeder Installation (z. B. MSYS2/MinGW-w64) Rücksprache halten.
-2. Geräteerkennung pro Kanal: `Unbekannt` → `Erkannt` durch gültigen Block mit PID; Blöcke ohne PID erben die Kanalerkennung; Rücksetzen bei Timeout (> ca. 3 s) oder PID-Wechsel. DeviceCatalog-PIDs korrigieren, 0xC035 aufnehmen, Simulator-PID korrigieren.
-3. Neuer FieldCatalog: Klarnamen, Einheiten, Skalierung; `---` = ungültig (nie 0); `ON`/`OFF` ohne Beachtung der Groß-/Kleinschreibung.
+   - PC-Tests: GCC 16.2.0 aus MSYS2 (`C:\msys64\ucrt64\bin`, im Benutzer-Path); `pio test -e native` läuft.
+2. Geräteerkennung pro Kanal (**noch offen**, Reihenfolge mit Stufe 3 getauscht): `Unbekannt` → `Erkannt` durch gültigen Block mit PID; Blöcke ohne PID erben die Kanalerkennung; Rücksetzen bei Timeout (> ca. 3 s) oder PID-Wechsel. Bisher nur vorläufig in der Logger-Task gelöst (letzte PID je Kanal für den Gerätenamen im Blockkopf).
+3. **(umgesetzt und getestet 05.11.2026)** Klarnamen und physikalische Werte:
+   - Neu: `FieldCatalog` (alle Felder von BMV-71x/SmartShunt und SmartSolar laut Doku 3.34; deutsche Klarnamen, Einheiten, Codetabellen CS/ERR/MPPT/MON, Bitmasken AR/OR/CAP_BLE), `ValueConverter` (Rohtext → `MeasuredValue` mit Status), `ValueFormatter` (Text mit Dezimalkomma, exakt aus dem Ganzzahlwert).
+   - Überarbeitet: `SemanticField`, `FieldDefinition`, `MeasuredValue`.
+   - `---` → „nicht verfügbar“ (nie 0), TTG `-1` → „unendlich“, ungültiger Rohtext → „ungültiger Wert“, `ON`/`OFF` ohne Beachtung der Groß-/Kleinschreibung.
+   - Ausgabe je Feld: `Klarname   umgerechneter Wert   Label = Rohwert`; Blockkopf mit Gerätename und PID.
+   - Testergebnis: 26/26 Unit-Tests auf PC und ESP32 bestanden (12 Parser, 14 Umrechnung/Formatierung/DeviceCatalog). Hardwaretest mit SmartShunt (UART1) und Simulator (UART2): Werte plausibel, 0 Prüfsummenfehler.
 4. Gerätezustand (Battery/MPPT) mit Zeitstempel und Gültigkeit; dann Display, Relais, SOC-Logik.
 
 ### Code-Stil
