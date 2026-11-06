@@ -45,6 +45,10 @@
  *
  *   6. Zu lange Labels/Werte, zu viele Felder oder Zeilen ohne Tabulator
  *      werden NICHT abgeschnitten, sondern der ganze Block wird verworfen.
+ *
+ *   7. Labels und Werte dürfen nur druckbares ASCII (0x20..0x7E) enthalten.
+ *      Andere Bytes (z. B. 0x00 beim Einstecken eines Steckers) verwerfen
+ *      den Block, da die Prüfsumme ein 0x00 nicht erkennen kann.
  ******************************************************************************/
 
 #pragma once

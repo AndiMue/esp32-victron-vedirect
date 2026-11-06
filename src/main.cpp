@@ -510,12 +510,15 @@ void printDeviceEvent(const LogMessage& msg)
 /// Periodische Statuszeile je Kanal, auch wenn ein Kanal keine Daten liefert.
 void printStatusReport()
 {
-    const uint32_t now = millis();
-
     for (size_t i = 0; i < ChannelCount; ++i)
     {
         const Channel&      channel = g_channels[i];
         const ChannelStatus status  = readStatus(channel);
+
+        // Zeit ERST NACH dem Kopieren lesen: Sonst kann der Zeitstempel im
+        // Status jünger sein als "now", und die vorzeichenlose Differenz
+        // läuft über (z. B. -6 ms -> 4294967290 ms).
+        const uint32_t now = millis();
 
         Serial.printf("[STATUS] %s: ", channel.name);
         printDevice(status.device);

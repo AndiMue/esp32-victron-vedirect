@@ -382,6 +382,79 @@ void test_line_without_tab_discards_block()
     TEST_ASSERT_EQUAL(1, r.discarded);
 }
 
+/// Fund aus dem Praxistest: Beim Einstecken entsteht ein 0x00 vor "PID".
+/// Die Prüfsumme stimmt trotzdem (0x00 zählt nicht) -> Block muss verworfen
+/// werden, sonst wäre das Label unsichtbar.
+void test_null_byte_in_label_discards_block()
+{
+    synchronize();
+
+    std::string body = "\r\n";
+    body += '\0';                                   // Störung beim Einstecken
+    body += "PID\t0xA057\r\nV\t13400\r\nChecksum\t";
+    const std::string block = appendChecksum(body);
+
+    const FeedResult r = feed(g_parser, block);
+    TEST_ASSERT_EQUAL(0, r.ready);
+    TEST_ASSERT_EQUAL(0, r.checksumErrors);          // Prüfsumme ist formal gültig!
+    TEST_ASSERT_EQUAL(1, r.discarded);
+
+    // Der nächste saubere Block wird normal angenommen.
+    TEST_ASSERT_EQUAL(1, feed(g_parser, deviceBlock({ { "PID", "0xA057" } })).ready);
+    TEST_ASSERT_EQUAL_STRING("0xA057", valueOf(g_parser, "PID"));
+}
+
+/// 0x00 mitten in einem Wert: würde "13400" zu "13" abschneiden
+/// (13 mV statt 13,4 V) -> Block verwerfen.
+void test_null_byte_in_value_discards_block()
+{
+    synchronize();
+    feed(g_parser, deviceBlock({ { "V", "12000" } }));   // gültiger Vorwert
+
+    std::string body = "\r\nV\t13";
+    body += '\0';
+    body += "400\r\nChecksum\t";
+
+    const FeedResult r = feed(g_parser, appendChecksum(body));
+    TEST_ASSERT_EQUAL(0, r.ready);
+    TEST_ASSERT_EQUAL(1, r.discarded);
+    TEST_ASSERT_EQUAL_STRING("12000", valueOf(g_parser, "V"));   // alter Wert bleibt
+}
+
+/// Weitere unzulässige Bytes: Steuerzeichen, Tabulator im Wert, Bytes >= 0x7F.
+void test_non_printable_bytes_discard_block()
+{
+    synchronize();
+
+    const char* const bodies[] =
+    {
+        "\r\nV\t13\x01" "400\r\nChecksum\t",   // Steuerzeichen im Wert
+        "\r\nV\t13\t400\r\nChecksum\t",        // Tabulator im Wert
+        "\r\nV\xFF\t13400\r\nChecksum\t",      // 0xFF im Label
+        "\r\nV\t134\x7F" "00\r\nChecksum\t",   // DEL im Wert
+    };
+
+    for (const char* body : bodies)
+    {
+        const FeedResult r = feed(g_parser, appendChecksum(body));
+        TEST_ASSERT_EQUAL_MESSAGE(1, r.discarded, "Block mit unzulaessigem Byte nicht verworfen");
+        TEST_ASSERT_EQUAL(0, r.ready);
+    }
+}
+
+/// Leerzeichen und typische Sonderzeichen in Werten bleiben erlaubt.
+void test_printable_special_characters_are_allowed()
+{
+    synchronize();
+
+    const FeedResult r = feed(g_parser, deviceBlock({
+        { "BMV", "SmartShunt 500A/50mV" }, { "SER#", "HQ25419R9R3" },
+        { "AR", "0" }, { "OR", "0x00000001" }, { "I", "-120" }, { "SOC", "---" } }));
+
+    TEST_ASSERT_EQUAL(1, r.ready);
+    TEST_ASSERT_EQUAL_STRING("SmartShunt 500A/50mV", valueOf(g_parser, "BMV"));
+}
+
 /// Nach reset() ist wieder eine Synchronisation nötig, Zähler sind 0.
 void test_reset_requires_resynchronization()
 {
@@ -413,6 +486,10 @@ int runAllTests()
     RUN_TEST(test_value_length_limit);
     RUN_TEST(test_too_many_fields_discard_block);
     RUN_TEST(test_line_without_tab_discards_block);
+    RUN_TEST(test_null_byte_in_label_discards_block);
+    RUN_TEST(test_null_byte_in_value_discards_block);
+    RUN_TEST(test_non_printable_bytes_discard_block);
+    RUN_TEST(test_printable_special_characters_are_allowed);
     RUN_TEST(test_reset_requires_resynchronization);
     return UNITY_END();
 }

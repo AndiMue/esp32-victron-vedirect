@@ -15,6 +15,25 @@ namespace
 {
     /// Label des letzten Feldes eines Blocks (Groß-/Kleinschreibung laut Doku).
     const char* const ChecksumLabel = "Checksum";
+
+    /**************************************************************************
+     * Darf dieses Byte in einem Label oder Wert vorkommen?
+     *
+     * Victron sendet Labels und Werte ausschließlich als druckbares ASCII
+     * (0x20..0x7E, Leerzeichen kommt z. B. in "SmartShunt 500A/50mV" vor).
+     *
+     * Hintergrund (Fund im Praxistest 05.11.2026): Beim Einstecken eines
+     * VE.Direct-Steckers entsteht ein Null-Byte (0x00). Die Modulo-256-
+     * Prüfsumme bemerkt das NICHT, weil 0x00 nichts zur Summe beiträgt.
+     * Ein 0x00 im Label machte "PID" unsichtbar; in einem Wert hätte es den
+     * Wert abgeschnitten ("13400" -> "13"). Deshalb führt jedes andere Byte
+     * zum Verwerfen des ganzen Blocks.
+     **************************************************************************/
+    bool isPrintableAscii(char c)
+    {
+        const uint8_t byte = static_cast<uint8_t>(c);
+        return byte >= 0x20 && byte <= 0x7E;
+    }
 }
 
 /******************************************************************************
@@ -231,6 +250,11 @@ VeDirectTextParser::Event VeDirectTextParser::parse(uint8_t byte)
                 // Zeilenanfang) ist unkritisch: einfach neu beginnen.
                 clearFieldBuffers();
             }
+            else if (!isPrintableAscii(c))
+            {
+                // Unzulässiges Byte (z. B. 0x00 beim Einstecken)
+                m_blockCorrupt = true;
+            }
             else if (m_labelLength < VeDirectField::LabelSize - 1)
             {
                 m_label[m_labelLength++] = c;
@@ -256,6 +280,12 @@ VeDirectTextParser::Event VeDirectTextParser::parse(uint8_t byte)
                 storeField();
                 clearFieldBuffers();
                 m_state = State::ReadLabel;
+            }
+            else if (!isPrintableAscii(c))
+            {
+                // Unzulässiges Byte im Wert (z. B. 0x00 oder Tabulator):
+                // Wert wäre verfälscht -> ganzen Block verwerfen.
+                m_blockCorrupt = true;
             }
             else if (m_valueLength < VeDirectField::ValueSize - 1)
             {
