@@ -268,3 +268,20 @@ const FieldDefinition& FieldCatalog::at(std::size_t index)
 {
     return Catalog[index];
 }
+
+const char* FieldCatalog::codeText(const FieldDefinition& definition, int64_t code)
+{
+    const CodeTable* table = definition.codes;
+    if (table == nullptr)
+    {
+        return nullptr;
+    }
+    for (std::size_t i = 0; i < table->count; ++i)
+    {
+        if (table->entries[i].code == code)
+        {
+            return table->entries[i].text;
+        }
+    }
+    return nullptr;
+}

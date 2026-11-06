@@ -6,11 +6,17 @@
  *   Stufe 2: Geräteerkennung pro Kanal (DeviceDetector)
  *   Stufe 3: Klarnamen und physikalische Werte
  *
+ *   Stufe 4a: Gerätezustand, Verbindungsüberwachung, Systemzustand, Fehlerwort
+ *
  * Aufbau (FreeRTOS-Tasks):
  *
  *   UART1 ─► Reader ─► Parser ─► DeviceDetector ─┐   uartTask (Core 0)
  *                                                  ├─► Queue ─► loggerTask ─► Serial (UART0)
  *   UART2 ─► Reader ─► Parser ─► DeviceDetector ─┘   uartTask (Core 1)
+ *
+ *   Zusätzlich je Kanal: DeviceState (Werte) + LinkMonitor (Verbindung),
+ *   geschützt durch einen Mutex. Die systemTask (1×/s) kopiert beide Kanäle
+ *   und berechnet daraus SystemState + Fehlerwort (SystemEvaluator).
  *
  * Grundregeln:
  *   - NUR die loggerTask schreibt auf Serial (UART0). Die UART-Tasks geben
@@ -28,13 +34,24 @@
 
 #include <Arduino.h>
 
+#include <cstring>
+
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+
+#include "RelayDriver.hpp"
+#include "StatusDisplay.hpp"
 
 #include "AppConfig.hpp"
 #include "DeviceCatalog.hpp"
 #include "DeviceDetector.hpp"
+#include "DeviceState.hpp"
+#include "LinkMonitor.hpp"
+#include "LoadController.hpp"
+#include "SystemState.hpp"
 #include "ValueConverter.hpp"
 #include "ValueFormatter.hpp"
 #include "VeDirectFrame.hpp"
@@ -55,8 +72,25 @@ namespace
 constexpr uint32_t DebugBaudrate     = 115200; ///< UART0 / USB-Monitor
 constexpr uint32_t StatusIntervalMs  = 5000;   ///< Statuszeile alle 5 s
 constexpr UBaseType_t LogQueueLength = 8;      ///< Puffer für Logger-Nachrichten
+constexpr UBaseType_t CommandQueueLength = 4;  ///< Schaltbefehle an die systemTask
 
-constexpr uint32_t UartTaskStack   = 4096;
+constexpr uint32_t SystemIntervalMs = 1000;   ///< Auswertung des Systemzustands
+
+/// Watchdog: Reagiert die systemTask oder eine UART-Task so lange nicht,
+/// startet der ESP32 neu -> GPIOs hochohmig -> alle Relais AUS.
+constexpr uint32_t WatchdogTimeoutS = 10;
+
+/// Relais-Anschlüsse (Pinplan 06.11.2026), Module aktiv Low.
+const RelayPin RelayPins[RelayCount] =
+{
+    { 25, true },   // R1 Wechselrichter / DC-DC
+    { 27, true },   // R2 Licht
+    { 32, true },   // R3 Kühlschrank
+};
+
+constexpr uint32_t UartTaskStack    = 4096;
+constexpr uint32_t SystemTaskStack  = 4096;
+constexpr uint32_t DisplayTaskStack = 6144;   ///< Grafik/Schriften
 constexpr uint32_t LoggerTaskStack = 6144;   ///< printf/snprintf mit Formatierung braucht etwas mehr
 
 /// Spaltenbreiten der Feldausgabe (in Zeichen, nicht Bytes – Umlaute!)
@@ -65,6 +99,8 @@ constexpr size_t ValueColumnWidth = 32;
 
 /// UART-Tasks haben höhere Priorität als der Logger: Empfang geht vor Ausgabe.
 constexpr UBaseType_t UartTaskPriority   = 2;
+constexpr UBaseType_t SystemTaskPriority = 1;
+constexpr UBaseType_t DisplayTaskPriority = 1;
 constexpr UBaseType_t LoggerTaskPriority = 1;
 
 /******************************************************************************
@@ -81,6 +117,7 @@ struct ChannelStatus
     uint32_t lastValidFrameMs = 0;            ///< millis() des letzten gültigen Blocks
     bool     hasValidFrame    = false;        ///< mindestens ein gültiger Block?
     uint32_t queueDrops       = 0;            ///< Nachrichten verloren (Queue voll)
+    bool     linkUnstable     = false;        ///< LinkMonitor: Verbindung instabil?
 };
 
 /******************************************************************************
@@ -126,6 +163,33 @@ struct Channel
     ChannelStatus       status;     ///< geschützt durch g_statusLock
     LogMessage          outgoing;   ///< Sendepuffer der UART-Task
                                     ///< (global statt auf dem Stack, ~1,8 KB)
+
+    // ---- Stufe 4a: geschützt durch stateMutex ----
+    DeviceState         deviceState;            ///< Werte des Geräts (~5 KB)
+    LinkMonitor         link;                   ///< Verbindungsqualität
+    SemaphoreHandle_t   stateMutex = nullptr;   ///< in setup() angelegt
+};
+
+/******************************************************************************
+ * RAII-Sperre für deviceState/link eines Kanals.
+ * Mutex statt Spinlock, da hier einige KB kopiert werden.
+ ******************************************************************************/
+class StateLock
+{
+public:
+    explicit StateLock(SemaphoreHandle_t mutex) : m_mutex(mutex)
+    {
+        xSemaphoreTake(m_mutex, portMAX_DELAY);
+    }
+    ~StateLock()
+    {
+        xSemaphoreGive(m_mutex);
+    }
+    StateLock(const StateLock&) = delete;
+    StateLock& operator=(const StateLock&) = delete;
+
+private:
+    SemaphoreHandle_t m_mutex;
 };
 
 /******************************************************************************
@@ -149,6 +213,89 @@ portMUX_TYPE g_statusLock = portMUX_INITIALIZER_UNLOCKED;
 
 /// Empfangspuffer der Logger-Task (global statt auf dem Stack).
 LogMessage g_incoming;
+
+/// Kopien der Kanalzustände für die systemTask (global statt auf dem Stack).
+DeviceState g_stateSnapshot[ChannelCount];
+LinkMonitor g_linkSnapshot[ChannelCount];
+
+/// Zuletzt berechneter Systemzustand, geschützt durch g_statusLock
+/// (klein, Kopie in Mikrosekunden).
+SystemState g_systemState;
+
+SystemState readSystemState()
+{
+    portENTER_CRITICAL(&g_statusLock);
+    const SystemState copy = g_systemState;
+    portEXIT_CRITICAL(&g_statusLock);
+    return copy;
+}
+
+/******************************************************************************
+ * Stufe 4b: Abschaltlogik
+ *
+ * Befehle (Taster/Touch, WebUI, MQTT – vorerst der serielle Monitor) werden
+ * per Queue an die systemTask geschickt. Nur sie verändert den
+ * LoadController. Ergebnis und Relais-Sollzustände stellt sie als
+ * ControlSnapshot bereit (geschützt durch g_statusLock).
+ ******************************************************************************/
+enum class CommandKind : uint8_t
+{
+    Relay,      ///< Relais ein/aus
+    Override    ///< Override ein/aus
+};
+
+struct ControlCommand
+{
+    CommandKind   kind   = CommandKind::Relay;
+    RelayId       relay  = RelayId::Main;
+    bool          on     = false;
+    CommandSource source = CommandSource::Local;
+};
+
+struct ControlSnapshot
+{
+    RelayStatus    relays[RelayCount];
+    const char*    names[RelayCount]   = {};
+    const char*    shortNames[RelayCount] = {};
+    bool           enabled[RelayCount] = {};
+    bool           overrideActive      = false;
+    uint32_t       commandCount        = 0;    ///< bearbeitete Befehle
+    ControlCommand lastCommand;
+    CommandResult  lastResult          = CommandResult::Accepted;
+};
+
+QueueHandle_t   g_commandQueue = nullptr;
+LoadController  g_loadController;      ///< nur in der systemTask verwenden!
+RelayDriver     g_relays(RelayPins);   ///< nur in setup() und der systemTask verwenden!
+ControlSnapshot g_control;             ///< geschützt durch g_statusLock
+
+ControlSnapshot readControl()
+{
+    portENTER_CRITICAL(&g_statusLock);
+    const ControlSnapshot copy = g_control;
+    portEXIT_CRITICAL(&g_statusLock);
+    return copy;
+}
+
+/// Aktuelle Einstellungen der Verbindungsüberwachung aus AppConfig.
+LinkMonitor::Config makeLinkConfig()
+{
+    LinkMonitor::Config config;
+    config.errorThreshold  = g_config.linkErrorThreshold.load();
+    config.outageThreshold = g_config.linkOutageThreshold.load();
+    config.recoveryMs      = g_config.linkRecoveryMs.load();
+    return config;
+}
+
+/// Aktuelle Einstellungen für die Systemauswertung aus AppConfig.
+SystemConfig makeSystemConfig()
+{
+    SystemConfig config;
+    config.requireBatteryMonitor = g_config.requireBatteryMonitor.load();
+    config.requirePvCharger      = g_config.requirePvCharger.load();
+    config.valueMaxAgeMs         = g_config.deviceTimeoutMs.load();
+    return config;
+}
 
 /******************************************************************************
  * Status eines Kanals threadsicher kopieren.
@@ -176,6 +323,7 @@ void publish(Channel& channel, LogKind kind, uint32_t now,
     channel.status.parser   = channel.parser.statistics();
     channel.status.device   = channel.detector.identity();
     channel.status.detector = channel.detector.statistics();
+    channel.status.linkUnstable = channel.link.isUnstable();   // eigene Task -> Lesen ohne Mutex ok
     if (kind == LogKind::Frame)
     {
         channel.status.lastValidFrameMs = now;
@@ -214,7 +362,34 @@ void checkDeviceTimeout(Channel& channel, uint32_t now)
 {
     if (channel.detector.checkTimeout(now) == DeviceDetector::Event::Lost)
     {
+        {
+            StateLock lock(channel.stateMutex);
+            channel.link.recordOutage(now);
+            channel.deviceState.clear();   // "--" statt veralteter Werte
+            channel.deviceState.setIdentity(channel.detector.identity());
+        }
         publish(channel, LogKind::DeviceLost, now);
+    }
+}
+
+/// Gültigen Block in den Gerätezustand übernehmen (Stufe 4a).
+void applyFrame(Channel& channel, const VeDirectFrame& frame,
+                const DeviceDetector::Result& result, uint32_t now)
+{
+    StateLock lock(channel.stateMutex);
+
+    if (result.event == DeviceDetector::Event::Changed)
+    {
+        // Anderes Gerät: Werte des alten Geräts dürfen nicht stehen bleiben
+        channel.deviceState.clear();
+    }
+    channel.deviceState.setIdentity(channel.detector.identity());
+
+    // Nur Blöcke des erkannten Geräts übernehmen
+    if (result.origin == DeviceDetector::Origin::Own ||
+        result.origin == DeviceDetector::Origin::Inherited)
+    {
+        channel.deviceState.apply(frame, now);
     }
 }
 
@@ -227,8 +402,12 @@ void uartTask(void* parameter)
 {
     Channel& channel = *static_cast<Channel*>(parameter);
 
+    esp_task_wdt_add(nullptr);   // UART-Task vom Watchdog überwachen
+
     for (;;)
     {
+        esp_task_wdt_reset();
+
         // Timeout laufend aus der Konfiguration übernehmen
         // (kann später z. B. über die WebUI geändert werden).
         channel.detector.setTimeoutMs(g_config.deviceTimeoutMs.load());
@@ -236,6 +415,14 @@ void uartTask(void* parameter)
         // Ausfall auch dann erkennen, wenn gar keine Bytes mehr kommen
         // (z. B. Stecker abgezogen, Kabelbruch).
         checkDeviceTimeout(channel, millis());
+
+        // Verbindungsüberwachung: Einstellungen übernehmen, Erholung prüfen
+        {
+            StateLock lock(channel.stateMutex);
+            channel.link.setConfig(makeLinkConfig());
+            channel.link.update(millis(),
+                                channel.detector.identity().state == DeviceDetector::State::Identified);
+        }
 
         while (channel.reader.available())
         {
@@ -268,15 +455,24 @@ void uartTask(void* parameter)
                         publish(channel, LogKind::DeviceChanged, now);
                     }
 
+                    applyFrame(channel, frame, result, now);
                     publish(channel, LogKind::Frame, now, result.origin, &frame);
                     break;
                 }
 
                 case VeDirectTextParser::Event::ChecksumError:
+                {
+                    StateLock lock(channel.stateMutex);
+                    channel.link.recordChecksumError(now);
+                }
                     publish(channel, LogKind::ChecksumError, now);
                     break;
 
                 default:
+                {
+                    StateLock lock(channel.stateMutex);
+                    channel.link.recordDiscardedFrame(now);
+                }
                     publish(channel, LogKind::FrameDiscarded, now);
                     break;
             }
@@ -285,6 +481,163 @@ void uartTask(void* parameter)
         // UART-FIFO/Puffer füllt sich mit ~2 Byte/ms (19200 Baud);
         // der Standard-RX-Puffer (256 Byte) reicht bei 1 Tick Pause locker.
         vTaskDelay(1);
+    }
+}
+
+/******************************************************************************
+ * System-Task: Systemzustand und Fehlerwort berechnen (1×/s).
+ *
+ * Kopiert die Kanalzustände unter Mutex, liest DANACH die Zeit und wertet
+ * aus. In Stufe 4b läuft hier zusätzlich die Abschaltlogik.
+ ******************************************************************************/
+/// Relais-Sollzustände für Logger (später Display/WebUI) veröffentlichen.
+void publishControl(const ControlCommand* command, CommandResult result)
+{
+    ControlSnapshot snapshot;
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const RelayId id = static_cast<RelayId>(i);
+        snapshot.relays[i]  = g_loadController.status(id);
+        snapshot.names[i]   = g_loadController.config().relays[i].name;
+        snapshot.shortNames[i] = g_loadController.config().relays[i].shortName;
+        snapshot.enabled[i] = g_loadController.config().relays[i].enabled;
+    }
+    snapshot.overrideActive = g_loadController.overrideActive();
+
+    portENTER_CRITICAL(&g_statusLock);
+    snapshot.commandCount = g_control.commandCount;
+    snapshot.lastCommand  = g_control.lastCommand;
+    snapshot.lastResult   = g_control.lastResult;
+    if (command != nullptr)
+    {
+        ++snapshot.commandCount;
+        snapshot.lastCommand = *command;
+        snapshot.lastResult  = result;
+    }
+    g_control = snapshot;
+    portEXIT_CRITICAL(&g_statusLock);
+}
+
+/// Systemzustand neu berechnen (Kanäle kopieren, auswerten, speichern).
+SystemState evaluateSystem()
+{
+    ChannelView views[ChannelCount];
+
+    for (size_t i = 0; i < ChannelCount; ++i)
+    {
+        {
+            StateLock lock(g_channels[i].stateMutex);
+            g_stateSnapshot[i] = g_channels[i].deviceState;
+            g_linkSnapshot[i]  = g_channels[i].link;
+        }
+        views[i].state = &g_stateSnapshot[i];
+        views[i].link  = &g_linkSnapshot[i];
+    }
+
+    // Zeit ERST NACH dem Kopieren lesen (sonst Überlauf der Altersrechnung)
+    const uint32_t now = millis();
+    const SystemState state =
+        SystemEvaluator::evaluate(views, ChannelCount, makeSystemConfig(), now);
+
+    portENTER_CRITICAL(&g_statusLock);
+    g_systemState = state;
+    portEXIT_CRITICAL(&g_statusLock);
+
+    return state;
+}
+
+/******************************************************************************
+ * System-Task: 1×/s Systemzustand + Abschaltlogik; Befehle sofort.
+ ******************************************************************************/
+void systemTask(void*)
+{
+    // Relais-Voreinstellung je Anlage; Neustart = Normalbetrieb (kein Override,
+    // Wechselrichter aus, R2/R3 an)
+    g_loadController.setConfig(g_config.installation.load() == Installation::Balcony
+                                   ? LoadControllerConfig::balcony()
+                                   : LoadControllerConfig::camper());
+    g_loadController.start(millis());
+    g_relays.apply(g_loadController);   // Startzustand ausgeben (R2/R3 ein)
+    publishControl(nullptr, CommandResult::Accepted);
+
+    esp_task_wdt_add(nullptr);          // diese Task vom Watchdog überwachen
+
+    SystemState state;
+    TickType_t  nextRun = xTaskGetTickCount();
+
+    for (;;)
+    {
+        esp_task_wdt_reset();
+
+        // Bis zur nächsten Auswertung auf Befehle warten
+        const TickType_t nowTick = xTaskGetTickCount();
+        const TickType_t wait = (static_cast<int32_t>(nextRun - nowTick) > 0) ? (nextRun - nowTick) : 0;
+
+        ControlCommand command;
+        if (xQueueReceive(g_commandQueue, &command, wait) == pdTRUE)
+        {
+            const uint32_t now = millis();
+            CommandResult result = CommandResult::Accepted;
+
+            if (command.kind == CommandKind::Override)
+            {
+                g_loadController.setOverride(command.on, state, now);
+            }
+            else
+            {
+                result = g_loadController.request(command.relay, command.on,
+                                                  command.source, state, now);
+            }
+            g_relays.apply(g_loadController);   // sofort schalten
+            publishControl(&command, result);
+            continue;   // weiter warten bis zur nächsten Auswertung
+        }
+
+        nextRun += pdMS_TO_TICKS(SystemIntervalMs);
+
+        state = evaluateSystem();
+        g_loadController.update(state, millis());
+        g_relays.apply(g_loadController);
+        publishControl(nullptr, CommandResult::Accepted);
+    }
+}
+
+/******************************************************************************
+ * Display-Task (Stufe 4c-2): E-Paper mit den wichtigsten Werten.
+ *
+ * Eigene Task, weil ein Bildaufbau bis zu ca. 2 s dauert. Nicht vom
+ * Watchdog überwacht: Ein hängendes Display darf die Steuerung nicht
+ * neu starten.
+ ******************************************************************************/
+StatusDisplay g_statusDisplay;   ///< nur in der displayTask verwenden!
+
+DisplayData makeDisplayData()
+{
+    DisplayData data;
+    data.system = readSystemState();
+
+    const ControlSnapshot control = readControl();
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        data.relayOn[i]        = control.relays[i].on;
+        data.relayEnabled[i]   = control.enabled[i];
+        data.relayShortName[i] = control.shortNames[i];
+    }
+    data.overrideActive = control.overrideActive;
+    return data;
+}
+
+void displayTask(void*)
+{
+    // Kurz warten, damit erste Messwerte vorliegen
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    g_statusDisplay.begin(makeDisplayData(), millis());
+
+    for (;;)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        g_statusDisplay.update(makeDisplayData(), millis());
     }
 }
 
@@ -539,8 +892,288 @@ void printStatusReport()
             continue;
         }
 
-        Serial.printf("letzter gültiger Block vor %lu ms\n",
-                      static_cast<unsigned long>(now - status.lastValidFrameMs));
+        Serial.printf("letzter gültiger Block vor %lu ms  Verbindung=%s\n",
+                      static_cast<unsigned long>(now - status.lastValidFrameMs),
+                      status.linkUnstable ? "INSTABIL" : "stabil");
+    }
+}
+
+/// Messwert mit Dezimalkomma und Einheit ausgeben, ungültig als "--".
+void printReading(const Reading& reading, int decimals, const char* unit)
+{
+    if (!reading.valid)
+    {
+        Serial.print("--");
+        return;
+    }
+
+    char text[24];
+    snprintf(text, sizeof(text), "%.*f", decimals, static_cast<double>(reading.value));
+    for (char* p = text; *p != '\0'; ++p)
+    {
+        if (*p == '.')
+        {
+            *p = ',';   // deutsches Dezimalkomma
+        }
+    }
+    Serial.printf("%s %s", text, unit);
+}
+
+/******************************************************************************
+ * Systemzeile (Stufe 4a): Batterie, PV, Fehlerwort.
+ *
+ *   [SYSTEM] Batterie (UART2): 12,330 V  0,000 A  0 W  SOC 100,0 %  TTG unendlich
+ *            | PV (UART1): 96 W  18,600 V  Bulk  | Fehler 0x00000000: keine
+ ******************************************************************************/
+void printSystemReport()
+{
+    const SystemState state = readSystemState();
+
+    // ---- Batterie ----
+    Serial.print("[SYSTEM] Batterie");
+    if (state.batteryChannel >= 0)
+    {
+        Serial.printf(" (%s): ", g_channels[state.batteryChannel].name);
+        printReading(state.batteryVoltage, 3, "V");
+        Serial.print("  ");
+        printReading(state.batteryCurrent, 3, "A");
+        Serial.print("  ");
+        printReading(state.batteryPower, 0, "W");
+        Serial.print("  SOC ");
+        printReading(state.stateOfCharge, 1, "%");
+        Serial.print("  TTG ");
+        if (state.timeToGoInfinite)
+        {
+            Serial.print("unendlich");
+        }
+        else
+        {
+            printReading(state.timeToGo, 0, "min");
+        }
+    }
+    else
+    {
+        Serial.print(": --");
+        if (state.batteryVoltage.valid && state.batteryVoltage.source == ValueSource::PvCharger)
+        {
+            // Ersatzwert, deutlich gekennzeichnet (nicht für die Steuerung!)
+            Serial.print("  (Spannung vom MPPT: ");
+            printReading(state.batteryVoltage, 3, "V");
+            Serial.print(")");
+        }
+    }
+
+    // ---- PV ----
+    Serial.print("  |  PV");
+    if (state.pvChannel >= 0)
+    {
+        Serial.printf(" (%s): ", g_channels[state.pvChannel].name);
+        printReading(state.pvPower, 0, "W");
+        Serial.print("  ");
+        printReading(state.pvVoltage, 3, "V");
+        Serial.printf("  %s", state.chargerStateText != nullptr ? state.chargerStateText : "--");
+    }
+    else
+    {
+        Serial.print(": --");
+    }
+
+    // ---- Fehlerwort ----
+    Serial.printf("  |  Fehler 0x%08lX", static_cast<unsigned long>(state.faults));
+    if (state.faults == 0)
+    {
+        Serial.println(": keine");
+        return;
+    }
+
+    Serial.printf(" %s: ", SystemEvaluator::severityText(state.severity));
+    bool first = true;
+    for (unsigned bit = 0; bit < SystemFault::BitCount; ++bit)
+    {
+        const uint32_t mask = 1u << bit;
+        if ((state.faults & mask) != 0)
+        {
+            Serial.printf("%s%s", first ? "" : ", ", SystemEvaluator::faultText(mask));
+            first = false;
+        }
+    }
+    Serial.println();
+}
+
+/******************************************************************************
+ * Stufe 4b: Ausgabe der Relais-Sollzustände
+ *
+ * Die Relais werden NOCH NICHT geschaltet (kommt in 4c). Angezeigt wird,
+ * was geschaltet WÜRDE.
+ ******************************************************************************/
+
+/// Stand der zuletzt ausgegebenen Schaltvorgänge/Befehle (nur Logger-Task).
+uint32_t g_printedSwitchCount[RelayCount] = {};
+uint32_t g_printedCommandCount = 0;
+bool     g_printedOverride = false;
+
+/// Kompakte Relaiszeile alle 5 s.
+void printRelayReport(const ControlSnapshot& control)
+{
+    Serial.print("[RELAIS] ");
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const RelayStatus& r = control.relays[i];
+        Serial.printf("%sR%u %s: ", i == 0 ? "" : "  |  ", static_cast<unsigned>(i + 1), control.names[i]);
+        if (!control.enabled[i])
+        {
+            Serial.print("deaktiviert");
+            continue;
+        }
+        Serial.print(r.on ? "EIN" : "AUS");
+        if (r.locked)
+        {
+            Serial.print(" (gesperrt)");
+        }
+    }
+    Serial.println(control.overrideActive ? "  |  !! OVERRIDE AKTIV !!" : "  |  Override: aus");
+}
+
+/// Schaltvorgänge, Override-Wechsel und Befehlsergebnisse sofort melden.
+void printControlChanges(const ControlSnapshot& control)
+{
+    const SystemState state = readSystemState();
+
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const RelayStatus& r = control.relays[i];
+        if (r.switchCount == g_printedSwitchCount[i])
+        {
+            continue;
+        }
+        g_printedSwitchCount[i] = r.switchCount;
+
+        Serial.printf("[RELAIS] R%u %s -> %s (%s, SOC ",
+                      static_cast<unsigned>(i + 1), control.names[i],
+                      r.on ? "EIN" : "AUS", r.reason);
+        printReading(state.stateOfCharge, 1, "%");
+        Serial.println(")");
+    }
+
+    if (control.overrideActive != g_printedOverride)
+    {
+        g_printedOverride = control.overrideActive;
+        Serial.println(control.overrideActive
+                           ? "[RELAIS] !! OVERRIDE AKTIV: alle Sperren aufgehoben !!"
+                           : "[RELAIS] Override beendet, Normalbetrieb");
+    }
+
+    if (control.commandCount != g_printedCommandCount)
+    {
+        g_printedCommandCount = control.commandCount;
+        if (control.lastCommand.kind == CommandKind::Relay)
+        {
+            Serial.printf("[BEFEHL] R%u %s: %s\n",
+                          static_cast<unsigned>(control.lastCommand.relay) + 1,
+                          control.lastCommand.on ? "ein" : "aus",
+                          LoadController::resultText(control.lastResult));
+        }
+    }
+}
+
+/******************************************************************************
+ * Befehle über den seriellen Monitor (zum Testen ohne Display)
+ *
+ *   r1 ein | r1 aus | override ein | override aus | hilfe
+ *
+ * Quelle ist "Local" (wie Taster/Touch). Groß-/Kleinschreibung egal.
+ ******************************************************************************/
+char   g_inputLine[32] = {};
+size_t g_inputLength   = 0;
+
+/// Vollständige Blockausgabe (jedes Feld) ein/aus. Standard: aus, damit
+/// der Monitor übersichtlich bleibt. Nur in der Logger-Task verwendet.
+bool g_showFrames = false;
+
+void printHelp()
+{
+    Serial.println("[HILFE] Befehle: r1 ein | r1 aus | override ein | override aus | "
+                   "bloecke ein | bloecke aus | hilfe");
+}
+
+/// Eine vollständige Eingabezeile auswerten.
+void handleCommandLine(char* line)
+{
+    // in Kleinbuchstaben wandeln
+    for (char* p = line; *p != '\0'; ++p)
+    {
+        if (*p >= 'A' && *p <= 'Z')
+        {
+            *p = static_cast<char>(*p - 'A' + 'a');
+        }
+    }
+
+    Serial.printf("> %s\n", line);
+
+    // ---- Anzeige-Befehle (direkt in der Logger-Task) ----
+    if (std::strcmp(line, "bloecke ein") == 0 || std::strcmp(line, "blöcke ein") == 0)
+    {
+        g_showFrames = true;
+        Serial.println("[AUSGABE] Blockausgabe EIN (jedes Feld, Klarname + Rohwert)");
+        return;
+    }
+    if (std::strcmp(line, "bloecke aus") == 0 || std::strcmp(line, "blöcke aus") == 0)
+    {
+        g_showFrames = false;
+        Serial.println("[AUSGABE] Blockausgabe AUS (nur Status, Ereignisse, Befehle)");
+        return;
+    }
+
+    ControlCommand command;
+    command.source = CommandSource::Local;
+
+    if (std::strcmp(line, "r1 ein") == 0 || std::strcmp(line, "r1 an") == 0 || std::strcmp(line, "r1 on") == 0)
+    {
+        command.kind = CommandKind::Relay; command.relay = RelayId::Main; command.on = true;
+    }
+    else if (std::strcmp(line, "r1 aus") == 0 || std::strcmp(line, "r1 off") == 0)
+    {
+        command.kind = CommandKind::Relay; command.relay = RelayId::Main; command.on = false;
+    }
+    else if (std::strcmp(line, "override ein") == 0 || std::strcmp(line, "override on") == 0)
+    {
+        command.kind = CommandKind::Override; command.on = true;
+    }
+    else if (std::strcmp(line, "override aus") == 0 || std::strcmp(line, "override off") == 0)
+    {
+        command.kind = CommandKind::Override; command.on = false;
+    }
+    else
+    {
+        printHelp();
+        return;
+    }
+
+    if (xQueueSend(g_commandQueue, &command, 0) != pdTRUE)
+    {
+        Serial.println("[BEFEHL] verworfen: Befehls-Queue voll");
+    }
+}
+
+/// Zeichen vom seriellen Monitor sammeln (nicht blockierend).
+void readSerialInput()
+{
+    while (Serial.available() > 0)
+    {
+        const char c = static_cast<char>(Serial.read());
+        if (c == '\r' || c == '\n')
+        {
+            if (g_inputLength > 0)
+            {
+                g_inputLine[g_inputLength] = '\0';
+                handleCommandLine(g_inputLine);
+                g_inputLength = 0;
+            }
+        }
+        else if (g_inputLength < sizeof(g_inputLine) - 1)
+        {
+            g_inputLine[g_inputLength++] = c;
+        }
     }
 }
 
@@ -555,12 +1188,15 @@ void loggerTask(void*)
     {
         // Mit Timeout warten, damit der Statusbericht auch dann kommt,
         // wenn kein Kanal Daten liefert.
-        if (xQueueReceive(g_logQueue, &g_incoming, pdMS_TO_TICKS(250)) == pdTRUE)
+        if (xQueueReceive(g_logQueue, &g_incoming, pdMS_TO_TICKS(100)) == pdTRUE)
         {
             switch (g_incoming.kind)
             {
                 case LogKind::Frame:
-                    printFrame(g_incoming);
+                    if (g_showFrames)   // Standard: aus ("bloecke ein")
+                    {
+                        printFrame(g_incoming);
+                    }
                     break;
 
                 case LogKind::ChecksumError:
@@ -576,10 +1212,17 @@ void loggerTask(void*)
             }
         }
 
+        readSerialInput();
+
+        const ControlSnapshot control = readControl();
+        printControlChanges(control);
+
         if (millis() - lastStatusMs >= StatusIntervalMs)
         {
             lastStatusMs = millis();
             printStatusReport();
+            printSystemReport();
+            printRelayReport(control);
         }
     }
 }
@@ -594,12 +1237,27 @@ void loggerTask(void*)
  ******************************************************************************/
 void setup()
 {
+    // ALLERERSTE Aktion: Relais in den sicheren Zustand (aus), noch vor
+    // allem anderen. Bis hierher hält der Pull-up die Relais aus.
+    g_relays.begin();
+
     Serial.begin(DebugBaudrate);
     delay(200);   // USB-Seriell kurz stabilisieren lassen
 
     Serial.println();
     Serial.println("--------------------------------------------------");
-    Serial.println("Victron VE.Direct Reader - Stufe 2+3 (Geräteerkennung, Klarnamen)");
+    Serial.println("Victron VE.Direct Reader - Stufe 4c (Relais, Watchdog, E-Paper)");
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        Serial.printf("Relais R%u: GPIO%u, %s\n", static_cast<unsigned>(i + 1),
+                      static_cast<unsigned>(g_relays.gpio(i)),
+                      g_relays.activeLow(i) ? "aktiv Low" : "aktiv High");
+    }
+    Serial.printf("Anlage: %s\n", g_config.installation.load() == Installation::Balcony
+                                      ? "Balkonkraftwerk" : "Camper");
+    Serial.println("Befehle im Monitor: r1 ein | r1 aus | override ein | override aus | "
+                   "bloecke ein | bloecke aus | hilfe");
+    Serial.println("Blockausgabe ist AUS (einschalten mit: bloecke ein)");
     Serial.println("UART1: RX 16 / TX 17    UART2: RX 26 / TX 33");
     Serial.printf("Geräte-Timeout: %lu ms\n",
                   static_cast<unsigned long>(g_config.deviceTimeoutMs.load()));
@@ -609,8 +1267,9 @@ void setup()
     Serial.println("Hinweis: Der erste Block je Kanal wird zur Synchronisation verworfen.");
     Serial.println("--------------------------------------------------");
 
-    g_logQueue = xQueueCreate(LogQueueLength, sizeof(LogMessage));
-    if (g_logQueue == nullptr)
+    g_logQueue     = xQueueCreate(LogQueueLength, sizeof(LogMessage));
+    g_commandQueue = xQueueCreate(CommandQueueLength, sizeof(ControlCommand));
+    if (g_logQueue == nullptr || g_commandQueue == nullptr)
     {
         Serial.println("FEHLER: Log-Queue konnte nicht angelegt werden (Speicher?)");
         for (;;)
@@ -621,12 +1280,32 @@ void setup()
 
     for (size_t i = 0; i < ChannelCount; ++i)
     {
+        g_channels[i].stateMutex = xSemaphoreCreateMutex();
+        if (g_channels[i].stateMutex == nullptr)
+        {
+            Serial.println("FEHLER: Mutex konnte nicht angelegt werden (Speicher?)");
+            for (;;)
+            {
+                delay(1000);
+            }
+        }
         g_channels[i].reader.begin();
     }
+
+    // Watchdog: Neustart (panic), wenn eine überwachte Task hängt
+    esp_task_wdt_init(WatchdogTimeoutS, true);
 
     // Logger zuerst starten, damit er bereit ist, bevor Nachrichten kommen.
     xTaskCreatePinnedToCore(loggerTask, "Logger", LoggerTaskStack,
                             nullptr, LoggerTaskPriority, nullptr, 1);
+
+    // Systemauswertung (Stufe 4a), 1×/s
+    xTaskCreatePinnedToCore(systemTask, "System", SystemTaskStack,
+                            nullptr, SystemTaskPriority, nullptr, 0);
+
+    // E-Paper (Stufe 4c-2)
+    xTaskCreatePinnedToCore(displayTask, "Display", DisplayTaskStack,
+                            nullptr, DisplayTaskPriority, nullptr, 1);
 
     // Je ein Kern pro UART-Kanal (wie bisher).
     xTaskCreatePinnedToCore(uartTask, "UART1", UartTaskStack,

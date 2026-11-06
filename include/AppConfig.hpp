@@ -21,8 +21,21 @@
 
 #include "DeviceDetector.hpp"
 
+/// Anlage, für die die Firmware arbeitet (bestimmt die Relais-Voreinstellung,
+/// siehe LoadControllerConfig::camper() / ::balcony()).
+enum class Installation : uint8_t
+{
+    Camper,    ///< R1 Wechselrichter (Taster/Touch), R2 Licht, R3 Kühlschrank
+    Balcony    ///< R1 DC-DC-Wandler (MQTT), R2/R3 deaktiviert
+};
+
 struct AppConfig
 {
+    /**************************************************************************
+     * Anlage. Wirkt beim Start der systemTask (später per WebUI/NVS).
+     **************************************************************************/
+    std::atomic<Installation> installation{Installation::Camper};
+
     /**************************************************************************
      * Geräte-Timeout in Millisekunden.
      *
@@ -31,6 +44,24 @@ struct AppConfig
      * Block; 5000 ms entsprechen also 5 verpassten Blöcken.
      **************************************************************************/
     std::atomic<uint32_t> deviceTimeoutMs{DeviceDetector::DefaultTimeoutMs};
+
+    /**************************************************************************
+     * Erforderliche Geräte (Projektinhaber: Shunt Pflicht, MPPT optional).
+     * Bestimmt die Schwere von "fehlt": erforderlich -> kritisch bzw.
+     * Warnung, optional -> nur Info.
+     **************************************************************************/
+    std::atomic<bool> requireBatteryMonitor{true};
+    std::atomic<bool> requirePvCharger{false};
+
+    /**************************************************************************
+     * Verbindungsüberwachung (LinkMonitor), siehe LinkMonitor.hpp.
+     * "Instabil" ab linkOutageThreshold Ausfällen ODER ab
+     * linkErrorThreshold Prüfsummenfehlern + verworfenen Blöcken.
+     * Erholung nach linkRecoveryMs ohne Fehler (0 = nie).
+     **************************************************************************/
+    std::atomic<uint32_t> linkErrorThreshold{3};
+    std::atomic<uint32_t> linkOutageThreshold{1};
+    std::atomic<uint32_t> linkRecoveryMs{120000};
 };
 
 /// Die eine globale Instanz (definiert in main.cpp).

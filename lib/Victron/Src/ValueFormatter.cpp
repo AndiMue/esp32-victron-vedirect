@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "DeviceCatalog.hpp"
+#include "FieldCatalog.hpp"
 
 namespace
 {
@@ -93,23 +94,6 @@ void appendUnit(TextBuffer& out, const char* unit)
     {
         out.append(" %s", unit);
     }
-}
-
-/// Code in Tabelle suchen.
-const char* findCode(const CodeTable* table, int64_t code)
-{
-    if (table == nullptr)
-    {
-        return nullptr;
-    }
-    for (std::size_t i = 0; i < table->count; ++i)
-    {
-        if (table->entries[i].code == code)
-        {
-            return table->entries[i].text;
-        }
-    }
-    return nullptr;
 }
 
 /// Bitmaske als Liste ausgeben: "Unterspannung, Niedriger SOC".
@@ -218,7 +202,7 @@ const char* ValueFormatter::format(const VeDirectField& field,
 
         case ValueType::Code:
         {
-            const char* codeText = findCode(def.codes, value.raw);
+            const char* codeText = FieldCatalog::codeText(def, value.raw);
             if (codeText != nullptr)
             {
                 out.append("%s", codeText);

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 #include "FieldDefinition.hpp"
 
@@ -26,4 +27,8 @@ public:
 
     /// Eintrag Nummer index (für Tests), index < size().
     static const FieldDefinition& at(std::size_t index);
+
+    /// Text zu einem Code bzw. Bit aus der Codetabelle des Feldes
+    /// (z. B. CS 3 -> "Bulk (Konstantstrom)"), sonst nullptr.
+    static const char* codeText(const FieldDefinition& definition, int64_t code);
 };

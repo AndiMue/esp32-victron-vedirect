@@ -88,13 +88,55 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
    - Ausgabe je Feld: `Klarname   umgerechneter Wert   Label = Rohwert`; Blockkopf mit Gerätename und PID.
    - Testergebnis: 26/26 Unit-Tests auf PC und ESP32 bestanden (12 Parser, 14 Umrechnung/Formatierung/DeviceCatalog). Hardwaretest mit SmartShunt (UART1) und Simulator (UART2): Werte plausibel, 0 Prüfsummenfehler.
 4. Gerätezustand und Steuerung, aufgeteilt in kleine Schritte (siehe „Anforderungen Steuerung“):
-   - **4a:** Gerätezustand (Batterie vom Shunt, PV vom MPPT) mit Gültigkeit und Zeitstempel je Wert, dazu das Fehlerwort. Noch ohne Relais. Entscheidungen des Projektinhabers (06.11.2026):
-     - „Verbindung instabil“: Fehler innerhalb von **5 Minuten** (Prüfsummenfehler, verworfene Blöcke, Ausfälle). Die Warnung erlischt nach **2 Minuten** ohne Fehler. Dafür **Fehlerzähler** anlegen. Die Schwellen sollen konfigurierbar sein.
+   - **4a (umgesetzt und getestet 06.11.2026):** Gerätezustand (Batterie vom Shunt, PV vom MPPT) mit Gültigkeit und Zeitstempel je Wert, dazu das Fehlerwort. Noch ohne Relais.
+     - Neu in `lib/System`: `DeviceState` (Werte je Kanal nach `SemanticField`), `LinkMonitor` (Verbindungsqualität), `SystemState`/`SystemEvaluator` (Rollen nach Gerätekategorie, Messwerte, Fehlerwort `SystemFault::*`, Schwere Info/Warnung/kritisch).
+     - `main.cpp`: Mutex je Kanal, neue `systemTask` (1×/s, Core 0), Systemzeile `[SYSTEM]` alle 5 s, Statuszeile mit `Verbindung=stabil/INSTABIL`.
+     - `AppConfig`: `requireBatteryMonitor` (true), `requirePvCharger` (false), `linkErrorThreshold` (3), `linkOutageThreshold` (1), `linkRecoveryMs` (120000).
+     - Testergebnis: 68/68 Unit-Tests auf PC und ESP32 (24 neu). Hardware: Shunt an UART2, MPPT an UART1 → Rollen richtig, Fehlerwort 0x00000000. RAM 16 %.
+     - „Batteriemonitor“ = Gerätekategorie im DeviceCatalog; im Projekt ist das der **SmartShunt** (BMV-7xx gehören ebenfalls dazu). Das Fehlerwort hat 32 Bit, 10 davon belegt.
+     Entscheidungen des Projektinhabers (06.11.2026):
+     - „Verbindung instabil“: **kein festes Zeitfenster**, stattdessen Zähler. Instabil ab **1 Ausfall** oder **3 Prüfsummenfehlern/verworfenen Blöcken**. Erholung nach **2 Minuten** ohne Fehler, aber nur bei verbundenem Gerät (Kabel ab → Warnung bleibt). Gesamtzähler laufen immer weiter. Erholzeit 0 = Warnung bleibt bis zum Neustart. Alles konfigurierbar.
+     - **Fehlt der Shunt**, wird die Batteriespannung **vom MPPT** übernommen und gekennzeichnet (`ValueSource::PvCharger`, Anzeige „Spannung vom MPPT“). SOC und Strom kommen nie vom MPPT.
      - **Zwei Batteriemonitore gleichzeitig** kommen eigentlich nicht vor. Falls doch: keine Steuerung und keine Anzeige möglich, Behandlung wie bei Ausfall des Shunts (kritisch).
      - **Nach Ausfall eines Geräts ungültige Werte anzeigen** (z. B. `--`), keine veralteten letzten Werte. Für die Steuerung sind sie ohnehin gesperrt.
      - Zeitdifferenzen immer erst NACH dem Kopieren des Zustands mit `millis()` bilden (sonst Überlauf, siehe Fehler 06.11.2026).
-   - **4b:** Abschaltlogik: Stufen, Hysterese, Spannungs-Rückfallebene, Verhalten bei Fehlern. Auf dem PC testbar.
-   - **4c:** Relais, Bedienung (Touch/Taster) und Display.
+   - **4b (umgesetzt und getestet 06.11.2026):** Abschaltlogik. Auf dem PC testbar. Läuft in der `systemTask` auf Basis von `SystemState`. **Die Relais werden noch nicht geschaltet** (GPIO kommt in 4c); `[RELAIS]` zeigt die Sollzustände.
+     - Neu: `lib/System/LoadController` mit `LoadControllerConfig::camper()` / `::balcony()`. Je Relais drei SOC-Schwellen (gesperrt unter / aus unter / frei ab), Betriebsart manuell (R1, nur per Befehl) oder automatisch (R2/R3, Mindest-Auszeit 60 s), erlaubte Befehlsquellen (Local/WebUI/MQTT), `rememberRequest` (BKW), `requiresSoc` + `forceOffWithoutSoc` (R1).
+     - **Bestätigt vom Projektinhaber (06.11.2026):** Fehlt der SOC (Shunt fehlt), wird ein **laufender** Wechselrichter **abgeschaltet** (nicht nur gesperrt), weil ohne SOC der Ladezustand unbekannt ist. Einstellbar über `forceOffWithoutSoc`.
+     - Automatische Relais (R2/R3) nehmen keine Befehle an; Override schaltet sie ein.
+     - `AppConfig::installation` (Camper/Balkonkraftwerk) wählt die Voreinstellung beim Start.
+     - Befehle per Queue an die `systemTask` (sofort bearbeitet). Zum Testen im seriellen Monitor: `r1 ein`, `r1 aus`, `override ein`, `override aus`, `hilfe` (Quelle „Local“).
+     - Testergebnis: 90/90 Unit-Tests auf PC und ESP32 (22 neu). Hardware: Befehle und Override per seriellem Monitor geprüft. Sperre/Abschaltung bei niedrigem SOC nur in Unit-Tests geprüft (Akku steht bei 100 %).
+     - Vorgabe Projektinhaber (06.11.2026): Liegt die Batteriespannung nur vom MPPT vor (Shunt fehlt), darf das **Wechselrichter-Relais NICHT schalten**. Kleinverbraucher dürfen weiterlaufen.
+     - Entscheidungen Projektinhaber (06.11.2026):
+       - **Alle Schwellwerte konfigurierbar** (später WebUI/NVS).
+       - **3 Relais:** R1 Hauptverbraucher (Camper: Wechselrichter, BKW: DC-DC-Wandler), R2 Licht, R3 Kühlschrank. Im BKW werden R2/R3 nicht genutzt.
+       - Akku ist **LiFePO4** → möglichst keine Spannungsschwellen (flache Kennlinie); Steuerung über SOC.
+       - Startwerte SOC: R1 Einschalten gesperrt unter **25 %**, wieder frei ab **30 %**. R2 aus unter **15 %**, frei ab **20 %**. R3 aus unter **5 %**, frei ab **10 %**.
+       - R1: Ein **laufender** Wechselrichter wird beim Sperren nicht abgeschaltet. Abgeschaltet wird erst bei einer **eigenen, konfigurierbaren Abschaltschwelle** (Vorschlag Standard: 15 %, wie R2).
+       - BKW: Der DC-DC wird **per MQTT aus der Hausautomatisierung** geschaltet. Entschieden: dasselbe R1 mit Befehlsquelle MQTT (+ WebUI) und Schutz, kein separates Relais.
+       - **Nach Neustart:** Wechselrichter bleibt **aus**, R2 und R3 **an**.
+       - **Override-Modus:** umgeht **alle** Sperren (SOC-Schwellen, Shunt fehlt, Wechselrichter-Sperre), setzt sich **nicht selbst zurück**, deutliche Anzeige im Display (z. B. Blitz/Ausrufezeichen). Entschieden: **Ein Neustart beendet den Override**, danach Normalbetrieb.
+       - **Keine Spannungs-Notabschaltung** vorerst (LiFePO4). Spannungsschwellen entfallen zunächst ganz.
+       - **R1-Befehlsquellen** je Anlage konfigurierbar (entschieden): Camper = Taster/Touch + WebUI, BKW = MQTT + WebUI. Schutz immer aktiv. Gemeinsame Befehlsschnittstelle für alle Quellen.
+       - BKW, **Abbruch der MQTT-Verbindung** (entschieden): Zustand halten, der SOC-Schutz bleibt aktiv. Umsetzung kommt mit MQTT.
+   - **4c-1 (umgesetzt 06.11.2026):** Relais werden geschaltet. Neu `src/RelayDriver.hpp`: aktiv Low (R1 GPIO25, R2 GPIO27, R3 GPIO32). `g_relays.begin()` ist die erste Aktion in `setup()` (Pegel „aus“ vorbelegen, dann Ausgang). Ausgabe nach jeder Auswertung und sofort nach jedem Befehl. **Task-Watchdog 10 s** (Panic → Neustart → Relais aus) für `systemTask` und beide UART-Tasks; der Logger wird nicht überwacht.
+     - Test 06.11.2026: Start ohne Neustart/Brownout, `r1 ein`/`r1 aus` per seriellem Monitor ausgeführt. Rückmeldung des Projektinhabers zum hörbaren Schalten steht noch aus.
+     - Beim Aufbau gefundene Verdrahtungsfehler (alle behoben): 5 V am Modul-VCC statt an JD-VCC (ESP32 lief nicht mehr), E-Paper VCC/GND vertauscht (Brownout-Schleife), GND-Leitung auf TXD (Flashen schlug fehl: „serial TX path seems to be down“).
+   - **4c-2 (umgesetzt 06.11.2026):** E-Paper. Neu `src/StatusDisplay.hpp/.cpp`, eigene `displayTask` (nicht vom Watchdog überwacht). Bibliothek `zinggjm/GxEPD2 @ ^1.5.0` (Treiber `GxEPD2_154_D67`), nur in `env:esp32dev`.
+     - Inhalt: SOC groß; Spannung (`*` = vom MPPT) und Strom; Leistung und PV-Leistung; 3 Relaisfelder (schwarz = EIN, durchgestrichen = deaktiviert); Statuszeile (Override > wichtigster Fehler > „OK“, schwarzer Balken bei Warnung/kritisch/Override). Texte ohne Umlaute (ae/oe/ue). Neu `RelayConfig::shortName` (WR/Licht/Kuehl, BKW: DC-DC).
+     - Aktualisierung: Teilaktualisierung bei Änderung; reine Wertänderung höchstens alle 30 s, Relais/Status sofort; alle 30 Teilaktualisierungen ein Vollbild. Danach `powerOff()`.
+     - SPI nur mit SCK 18 / MOSI 23 gestartet, damit GPIO19 (Reserve R4) frei bleibt. `init(0)`: keine Diagnoseausgabe auf Serial.
+     - Test 06.11.2026: Firmware läuft stabil (RAM 17,9 %, Flash 24,8 %). **Anzeige selbst noch vom Projektinhaber zu bestätigen.**
+   - **Hinweis Build-Umgebung:** Auf dem PC sind zwei PlatformIO-Versionen installiert. `pio` im PATH ist **6.1.18** (Python 3.13, `...\Python313\Scripts\pio.exe`) und scheitert beim Bauen von GxEPD2 („opening dependency file … No such file or directory“). **Immer die VS-Code-Version 6.2.0 verwenden:** `%USERPROFILE%\.platformio\penv\Scripts\pio.exe`.
+   - Nach einer Änderung an `platformio.ini` liest die PlatformIO-Erweiterung in VS Code das Projekt neu ein und arbeitet dabei im selben `.pio`-Ordner. Ein gleichzeitig gestarteter Build scheitert dann mit „WinError 2 … .cpp.d“. Abhilfe: kurz warten, erneut bauen.
+   - **E-Paper, Fehlersuche Schwarz/Grau (06.11.2026):**
+     - Treiber `GxEPD2_154_GDEY0154D67` (Panel „FPC-B001-exp 24.08.02“), statt `GxEPD2_154_D67`.
+     - **Kurzer Reset-Impuls** `init(0, true, 2, false)` (GxEPD2-README: Waveshare-Platinen mit „clever reset circuit“). Damit ist das **Vollbild zuverlässig deckend schwarz** (bestätigt). Vorher: mal deckend, mal grau.
+     - **Teilaktualisierung** (`0x22 0xFC`, Kurve aus dem Panel-OTP) hellt unveränderte schwarze Pixel grau auf; das gilt für beide Treiber. Entscheidung Projektinhaber: **immer Vollbild** (`UsePartialRefresh = false`), Intervall bleibt **30 s** für Werte, Relais/Fehler/Override sofort. Ein schnellerer Verschleiß des Displays wird bewusst in Kauf genommen.
+     - Offen: Ist ein anderes Display besser geeignet? (siehe Antwort vom 06.11.2026: z. B. kleines IPS-TFT ST7789 an denselben SPI-Pins)
+   - **Serieller Monitor (06.11.2026):** Blockausgabe standardmäßig **aus**; sichtbar sind nur `[STATUS]`, `[SYSTEM]`, `[RELAIS]` (alle 5 s), Ereignisse und Befehle. Befehle `bloecke ein` / `bloecke aus` schalten die vollständige Blockausgabe um. `monitor_echo = yes` in `platformio.ini`: Eingaben sind beim Tippen sichtbar.
+   - **Danach:** Bedienung (Touch/Taster) über das Bediengerät, WLAN/MQTT, WebUI.
    - Offen: Sollen die lokal vorhandenen StateBuilder-Klassen des Projektinhabers einbezogen werden?
 
 ## Anforderungen Steuerung (Stand: 05.11.2026, vom Projektinhaber)
@@ -138,8 +180,35 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 - Mit Touch-Display wird über Touch bedient.
 - Ohne Touch-Display: Taster nötig. Die Taster sitzen **weit entfernt vom ESP32**. Denkbar ist deshalb ein eigenes Bediengerät mit mehreren Tastern, das über einen Bus mit dem ESP32 kommuniziert (Bus noch offen).
 
+### Architektur Anzeige/Bedienung (Entscheidung 06.11.2026)
+- Das **Touch-Display sitzt weit entfernt** vom Steuergerät → eigenes **Bediengerät** (2. ESP32 + 3,6" TFT-Shield ST7793, 240×400, 8-Bit parallel, resistiver Touch), angebunden per **WLAN** (ESP-NOW oder WLAN/WebSocket, noch offen). Kein Bluetooth (ein Funkmodul, WLAN wird für MQTT gebraucht). Im Camper evtl. ohne Router → Steuergerät als Access Point (AP+STA).
+- Grundregel: Die Steuerung bleibt im Steuergerät. Fällt die Funkverbindung aus, schaltet nichts um.
+- Am Steuergerät selbst: **Waveshare 1.54inch e-Paper Module Rev2.1 (V2)**, schwarz-weiß 200×200, Teilaktualisierung möglich, BS = 0 (4-Draht-SPI), VCC 3,3/5 V. Nur die wichtigsten Werte. Bibliothek voraussichtlich GxEPD2 (Treiber noch prüfen).
+
+### Pinbelegung Steuergerät (ESP32-WROOM-32), bestätigt 06.11.2026
+| Funktion | GPIO |
+|---|---|
+| UART0 Debug/USB | 1 TX, 3 RX |
+| UART1 VE.Direct | 16 RX, 17 TX (TX für späteres HEX-Protokoll) |
+| UART2 VE.Direct | 26 RX, 33 TX (TX für späteres HEX-Protokoll) |
+| Relais R1 (Wechselrichter/DC-DC) | 25 |
+| Relais R2 (Licht) | 27 |
+| Relais R3 (Kühlschrank) | 32 |
+| Reserve Relais R4 | 19 |
+| E-Paper SCK / DIN | 18 / 23 (VSPI) |
+| E-Paper CS / DC / RST | 5 / 13 / 4 |
+| E-Paper BUSY | 34 (reiner Eingang) |
+| I²C Reserve | 21 SDA, 22 SCL |
+| Reserve Eingänge | 35, 36, 39 (externer Pull-up nötig; 36/39 analog) |
+| Nicht verwenden | 0, 2, 12, 14, 15 (Strapping/Bootsignale) |
+
+- **Board:** „MINI32 V1.0.0“ (ESP32-WROOM-32, D1-mini-Format, CH9102-USB). Beschriftung nur auf der **Unterseite** (von oben gesehen links/rechts vertauscht). JTAG-Namen: **TCK = GPIO13**, TMS = 14, TDI = 12, TDO = 15; SVP = 36, SVN = 39. **SD0 („SDD“)/SD1/SD2/SD3/CLK/CMD = Flash, nie verwenden.** „VCC“ = 5 V vom USB.
+- **Relaismodule** (Stand 06.11.2026): „2 Relay Module“ mit PC817-Optokoppler und JD-VCC-Jumper, **aktiv Low** (IN = Low → Relais an). Verdrahtung für sicheren Zustand: Jumper JD-VCC↔VCC **ab**, Modul-**VCC an 3,3 V**, **JD-VCC an 5 V**, **10 kΩ Pull-up von 3,3 V an jedes IN** (ersetzt den ursprünglich geplanten Pull-down). ESP32-Pin hochohmig (Boot/Reset/Absturz) → Relais aus. Firmware: aktiv Low, beim Start erst High setzen, dann auf Ausgang schalten; Watchdog.
+- VE.Direct-TX: Der Pegelwandler sollte die Leitung beim Booten (TX hochohmig) definiert auf High halten (MPPT-RX kann Fernein/aus sein).
+- `ESP32_Pinbelegung.xlsx` ist dadurch teilweise veraltet (UART2 TX, Relais-Pins, Display).
+
 ### Offene Fragen
-- **Wie viele Relais werden tatsächlich gebraucht?** (Balkonkraftwerk: 1; Camper: noch offen)
+- ~~Wie viele Relais werden tatsächlich gebraucht?~~ → 3 (R1–R3), Reserve R4 auf GPIO19.
 - **Pinbelegung überdenken:** Im Excel sind Relais auf GPIO5 und GPIO15 vorgesehen. Das sind Boot-Strapping-Pins, die beim Start Pegel bzw. Signale ausgeben; GPIO14 gibt beim Booten ein PWM-Signal aus. Ein Relais darf beim Booten nicht kurz anziehen. Mit einem Touch-Display (SPI/I²C) ändert sich der Pinbedarf zusätzlich.
 - Darf manuelles Einschalten (z. B. Wechselrichter) die Schutzabschaltung überstimmen (Notbetrieb)? Vorschlag: nein, Schutz geht vor Bedienung.
 - Konkrete Schwellenwerte für SOC und Spannung sowie die Hysterese.

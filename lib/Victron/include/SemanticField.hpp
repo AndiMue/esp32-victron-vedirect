@@ -78,5 +78,7 @@ enum class SemanticField : uint16_t
     MaximumPowerToday,      ///< H21
     YieldYesterday,         ///< H22
     MaximumPowerYesterday,  ///< H23
-    DaySequence             ///< HSDS
+    DaySequence,            ///< HSDS
+
+    Count                   ///< Anzahl der Einträge (kein Feld, immer zuletzt!)
 };
