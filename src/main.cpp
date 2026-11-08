@@ -42,8 +42,12 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include <LittleFS.h>
+
 #include "RelayDriver.hpp"
 #include "StatusDisplay.hpp"
+#include "WebUi.hpp"
+#include "WifiManager.hpp"
 
 #include "AppConfig.hpp"
 #include "DeviceCatalog.hpp"
@@ -79,6 +83,23 @@ constexpr uint32_t SystemIntervalMs = 1000;   ///< Auswertung des Systemzustands
 /// Watchdog: Reagiert die systemTask oder eine UART-Task so lange nicht,
 /// startet der ESP32 neu -> GPIOs hochohmig -> alle Relais AUS.
 constexpr uint32_t WatchdogTimeoutS = 10;
+
+/// WebUI (Stufe W1)
+const char* const DeviceName      = "VE.Direct Steuergerät";
+const char* const FirmwareVersion = "W1 " __DATE__ " " __TIME__;
+const char* const DefaultHostname = "ve-direct";   ///< http://ve-direct.local
+const char* const ApPrefix        = "VE-Direct";   ///< AP-Name: VE-Direct-XXXX
+constexpr uint32_t WebTaskStack   = 8192;
+constexpr UBaseType_t WebTaskPriority = 1;
+
+/// Netzwerk-Reset-Taste (Pinplan: Reserve-Eingang IO35, reiner Eingang ohne
+/// internen Pull-up -> externer 10-kΩ-Pull-up nach 3,3 V nötig, Taste nach GND).
+/// Beim Einschalten ResetHoldMs gedrückt halten und dann loslassen ->
+/// WLAN + Gerätepasswort werden zurückgesetzt (neues Startpasswort, siehe
+/// Display). Wird nicht losgelassen (Pin dauerhaft Low): kein Reset.
+constexpr uint8_t  ResetButtonPin       = 35;
+constexpr uint32_t ResetHoldMs          = 10000;
+constexpr uint32_t ResetReleaseWindowMs = 5000;
 
 /// Relais-Anschlüsse (Pinplan 06.11.2026), Module aktiv Low.
 const RelayPin RelayPins[RelayCount] =
@@ -268,6 +289,21 @@ QueueHandle_t   g_commandQueue = nullptr;
 LoadController  g_loadController;      ///< nur in der systemTask verwenden!
 RelayDriver     g_relays(RelayPins);   ///< nur in setup() und der systemTask verwenden!
 ControlSnapshot g_control;             ///< geschützt durch g_statusLock
+
+/******************************************************************************
+ * Stufe W1: WLAN und WebUI (nur in der webTask verwenden!)
+ ******************************************************************************/
+WifiManager g_wifi;
+WebUi       g_webUi;
+NetStatus   g_netStatus;   ///< Kopie für Logger/Display, geschützt durch g_statusLock
+
+NetStatus readNetStatus()
+{
+    portENTER_CRITICAL(&g_statusLock);
+    const NetStatus copy = g_netStatus;
+    portEXIT_CRITICAL(&g_statusLock);
+    return copy;
+}
 
 ControlSnapshot readControl()
 {
@@ -624,7 +660,100 @@ DisplayData makeDisplayData()
         data.relayShortName[i] = control.shortNames[i];
     }
     data.overrideActive = control.overrideActive;
+
+    // Ersteinrichtung: AP-Name und Startpasswort anzeigen, solange das
+    // Gerätepasswort nicht geändert wurde und der AP aktiv ist.
+    const NetStatus net = readNetStatus();
+    data.wifiConnected  = net.staConnected;
+    data.wifiRssi       = net.rssi;
+    data.apActive       = net.apActive;
+    data.mqttConfigured = false;   // MQTT folgt in W3
+    data.mqttConnected  = false;
+
+    data.showSetup = net.apActive && net.defaultPassword && net.displayPassword[0] != '\0';
+    if (data.showSetup)
+    {
+        std::strncpy(data.setupSsid, net.apSsid, sizeof(data.setupSsid) - 1);
+        std::strncpy(data.setupPassword, net.displayPassword, sizeof(data.setupPassword) - 1);
+    }
     return data;
+}
+
+/******************************************************************************
+ * Web-Task (Stufe W1): WLAN-Verwaltung und Webserver.
+ *
+ * Nicht vom Watchdog überwacht: WLAN-Probleme dürfen die Steuerung nicht
+ * neu starten. Schreibt nicht auf Serial (Meldungen über g_netStatus an
+ * den Logger).
+ ******************************************************************************/
+void webTask(void*)
+{
+    // Dateisystem für die WebUI-Dateien (true = bei leerem/defektem
+    // Dateisystem formatieren; Dateien dann per "uploadfs" aufspielen)
+    LittleFS.begin(true);
+
+    g_wifi.begin(DefaultHostname, ApPrefix);
+    g_webUi.begin(g_wifi, DeviceName, FirmwareVersion);
+
+    for (;;)
+    {
+        const uint32_t now = millis();
+        g_wifi.loop(now);
+        g_webUi.loop(now);
+
+        const NetStatus status = g_wifi.status();
+        portENTER_CRITICAL(&g_statusLock);
+        g_netStatus = status;
+        portEXIT_CRITICAL(&g_statusLock);
+
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+/// Netzwerk-Reset-Taste prüfen (nur in setup(), vor dem Start des WLAN).
+void checkResetButton()
+{
+    pinMode(ResetButtonPin, INPUT);   // IO35: kein interner Pull-up möglich
+
+    if (digitalRead(ResetButtonPin) != LOW)
+    {
+        return;   // nicht gedrückt
+    }
+
+    // Fehlersicher (08.11.2026): Reset erst beim LOSLASSEN nach ResetHoldMs.
+    // Ein dauerhaft auf Low liegender Pin (fehlender Pull-up, Kabelbruch,
+    // klemmende Taste) löst so NIE einen Reset aus.
+    Serial.printf("[RESET] Taste an IO%u gedrückt: %lu s halten, dann loslassen = Netzwerk-Reset\n",
+                  static_cast<unsigned>(ResetButtonPin),
+                  static_cast<unsigned long>(ResetHoldMs / 1000));
+
+    const uint32_t start = millis();
+    while (millis() - start < ResetHoldMs)
+    {
+        if (digitalRead(ResetButtonPin) != LOW)
+        {
+            Serial.println("[RESET] Taste zu früh losgelassen, kein Reset.");
+            return;
+        }
+        delay(50);
+    }
+
+    Serial.println("[RESET] Jetzt loslassen (innerhalb von 5 s) ...");
+    const uint32_t releaseStart = millis();
+    while (millis() - releaseStart < ResetReleaseWindowMs)
+    {
+        if (digitalRead(ResetButtonPin) != LOW)
+        {
+            WifiManager::factoryResetNetwork();
+            Serial.println("[RESET] Netzwerk-Einstellungen gelöscht: WLAN und Gerätepasswort "
+                           "zurückgesetzt. Neues Startpasswort siehe Display/Monitor.");
+            return;
+        }
+        delay(50);
+    }
+
+    Serial.printf("[RESET] WARNUNG: IO%u liegt dauerhaft auf Low (Pull-up fehlt? Taste klemmt?). "
+                  "Kein Reset ausgeführt.\n", static_cast<unsigned>(ResetButtonPin));
 }
 
 void displayTask(void*)
@@ -1178,6 +1307,73 @@ void readSerialInput()
 }
 
 /******************************************************************************
+ * Stufe W1: WLAN-Meldungen
+ ******************************************************************************/
+const char* netStateText(NetState state)
+{
+    switch (state)
+    {
+        case NetState::AccessPoint: return "nur Access Point (kein WLAN eingerichtet)";
+        case NetState::Connecting:  return "verbinde mit WLAN";
+        case NetState::Connected:   return "mit WLAN verbunden";
+        case NetState::Fallback:    return "WLAN nicht erreichbar, Access Point aktiv";
+    }
+    return "?";
+}
+
+/// Zuletzt gemeldeter Netzwerkzustand (nur Logger-Task).
+bool      g_netPrinted = false;
+NetStatus g_netLast;
+
+/// WLAN-Zustand ausgeben (bei Änderung sofort, sonst mit dem Statusbericht).
+void printNetwork(const NetStatus& n)
+{
+    Serial.printf("[WLAN] %s", netStateText(n.state));
+    if (n.staConnected)
+    {
+        Serial.printf("  |  %s  IP %s  %d dBm  ->  http://%s.local",
+                      n.staSsid, IPAddress(n.staIp).toString().c_str(),
+                      static_cast<int>(n.rssi), n.hostname);
+    }
+    if (!n.staConnected && n.lastFailReason != 0)
+    {
+        Serial.printf("  |  Fehler: %s (Code %u)", WifiManager::reasonText(n.lastFailReason),
+                      static_cast<unsigned>(n.lastFailReason));
+    }
+    if (n.apActive)
+    {
+        Serial.printf("  |  AP \"%s\"  IP %s  Geräte: %u",
+                      n.apSsid, IPAddress(n.apIp).toString().c_str(),
+                      static_cast<unsigned>(n.apClients));
+        if (n.defaultPassword)
+        {
+            // Nur am USB-Monitor (physischer Zugriff) und solange es das
+            // Startpasswort ist; gilt für AP und WebUI-Login (admin).
+            Serial.printf("  Startpasswort: %s", n.displayPassword);
+        }
+    }
+    Serial.println();
+}
+
+void printNetworkChanges()
+{
+    const NetStatus n = readNetStatus();
+    const bool changed = !g_netPrinted ||
+                         n.state != g_netLast.state ||
+                         n.apActive != g_netLast.apActive ||
+                         n.staConnected != g_netLast.staConnected ||
+                         n.staIp != g_netLast.staIp ||
+                         n.defaultPassword != g_netLast.defaultPassword ||
+                         n.lastFailReason != g_netLast.lastFailReason;
+    if (changed && n.apSsid[0] != '\0')   // erst ausgeben, wenn WLAN gestartet ist
+    {
+        printNetwork(n);
+        g_netLast = n;
+        g_netPrinted = true;
+    }
+}
+
+/******************************************************************************
  * Logger-Task: einzige Stelle, die auf Serial (UART0) schreibt.
  ******************************************************************************/
 void loggerTask(void*)
@@ -1216,6 +1412,7 @@ void loggerTask(void*)
 
         const ControlSnapshot control = readControl();
         printControlChanges(control);
+        printNetworkChanges();
 
         if (millis() - lastStatusMs >= StatusIntervalMs)
         {
@@ -1223,6 +1420,10 @@ void loggerTask(void*)
             printStatusReport();
             printSystemReport();
             printRelayReport(control);
+            if (g_netPrinted)
+            {
+                printNetwork(readNetStatus());
+            }
         }
     }
 }
@@ -1246,7 +1447,8 @@ void setup()
 
     Serial.println();
     Serial.println("--------------------------------------------------");
-    Serial.println("Victron VE.Direct Reader - Stufe 4c (Relais, Watchdog, E-Paper)");
+    Serial.println("Victron VE.Direct Reader - Stufe W1 (WLAN, WebUI)");
+    Serial.printf("Firmware: %s\n", FirmwareVersion);
     for (size_t i = 0; i < RelayCount; ++i)
     {
         Serial.printf("Relais R%u: GPIO%u, %s\n", static_cast<unsigned>(i + 1),
@@ -1292,6 +1494,9 @@ void setup()
         g_channels[i].reader.begin();
     }
 
+    // Netzwerk-Reset-Taste (vor dem Start des WLAN)
+    checkResetButton();
+
     // Watchdog: Neustart (panic), wenn eine überwachte Task hängt
     esp_task_wdt_init(WatchdogTimeoutS, true);
 
@@ -1306,6 +1511,10 @@ void setup()
     // E-Paper (Stufe 4c-2)
     xTaskCreatePinnedToCore(displayTask, "Display", DisplayTaskStack,
                             nullptr, DisplayTaskPriority, nullptr, 1);
+
+    // WLAN + WebUI (Stufe W1)
+    xTaskCreatePinnedToCore(webTask, "Web", WebTaskStack,
+                            nullptr, WebTaskPriority, nullptr, 0);
 
     // Je ein Kern pro UART-Kanal (wie bisher).
     xTaskCreatePinnedToCore(uartTask, "UART1", UartTaskStack,

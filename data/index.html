@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!-- VE.Direct WebUI, Stufe W1 (Status, WLAN, Gerät). Keine externen Quellen. -->
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VE.Direct</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1 id="deviceName">VE.Direct</h1>
+    <nav>
+      <button class="tab active" data-tab="status">Status</button>
+      <button class="tab" data-tab="wifi">WLAN</button>
+      <button class="tab" data-tab="device">Gerät</button>
+    </nav>
+  </header>
+
+  <main>
+    <div id="pwWarning" class="banner warn hidden">
+      Das Gerätepasswort ist noch das Startpasswort. Bitte unter <b>Gerät</b> ändern.
+    </div>
+
+    <!-- ===================== Status ===================== -->
+    <section id="tab-status" class="panel">
+      <h2>Netzwerk</h2>
+      <dl class="grid">
+        <dt>Zustand</dt>        <dd id="stState">–</dd>
+        <dt>Letzter Fehler</dt> <dd id="stError">–</dd>
+        <dt>WLAN</dt>           <dd id="stSsid">–</dd>
+        <dt>IP-Adresse</dt>     <dd id="stIp">–</dd>
+        <dt>Signal</dt>         <dd id="stRssi">–</dd>
+        <dt>Access Point</dt>   <dd id="stAp">–</dd>
+        <dt>Adresse</dt>        <dd id="stHost">–</dd>
+      </dl>
+      <h2>Gerät</h2>
+      <dl class="grid">
+        <dt>Firmware</dt>       <dd id="stFw">–</dd>
+        <dt>Laufzeit</dt>       <dd id="stUptime">–</dd>
+        <dt>Freier Speicher</dt><dd id="stHeap">–</dd>
+      </dl>
+    </section>
+
+    <!-- ===================== WLAN ===================== -->
+    <section id="tab-wifi" class="panel hidden">
+      <h2>WLAN verbinden</h2>
+      <form id="wifiForm">
+        <label>Netzwerk (SSID)
+          <input id="wifiSsid" name="ssid" maxlength="32" required list="ssidList" autocomplete="off">
+          <datalist id="ssidList"></datalist>
+        </label>
+        <button type="button" id="scanBtn" class="secondary">Netzwerke suchen</button>
+        <ul id="scanList" class="scanlist"></ul>
+
+        <label>Passwort
+          <input id="wifiPass" name="password" type="password" maxlength="63" autocomplete="new-password">
+          <small id="wifiPassHint">Leer lassen = bisheriges Passwort behalten.</small>
+        </label>
+        <label class="check small"><input type="checkbox" data-show="wifiPass"> Passwort anzeigen</label>
+
+        <label class="check">
+          <input id="apAlways" name="apAlways" type="checkbox">
+          Access Point immer eingeschaltet lassen (z. B. Camper ohne Router)
+        </label>
+
+        <button type="submit">Speichern und verbinden</button>
+      </form>
+
+      <h2>WLAN zurücksetzen</h2>
+      <p>Löscht die WLAN-Zugangsdaten. Das Gerät ist danach nur noch über seinen Access Point erreichbar.</p>
+      <button id="wifiResetBtn" class="danger">WLAN-Zugangsdaten löschen</button>
+    </section>
+
+    <!-- ===================== Gerät ===================== -->
+    <section id="tab-device" class="panel hidden">
+      <h2>Gerätepasswort ändern</h2>
+      <p>Gilt für den Access Point (WLAN-Passwort) <b>und</b> die Anmeldung an dieser Seite (Benutzer <code>admin</code>).</p>
+      <form id="pwForm">
+        <label>Aktuelles Passwort
+          <input id="pwCurrent" type="password" required autocomplete="current-password">
+        </label>
+        <label>Neues Passwort (8–63 Zeichen)
+          <input id="pwNew" type="password" minlength="8" maxlength="63" required autocomplete="new-password">
+        </label>
+        <label>Neues Passwort wiederholen
+          <input id="pwNew2" type="password" minlength="8" maxlength="63" required autocomplete="new-password">
+        </label>
+        <label class="check small"><input type="checkbox" data-show="pwCurrent,pwNew,pwNew2"> Passwörter anzeigen</label>
+        <button type="submit">Passwort ändern</button>
+      </form>
+
+      <h2>Neustart</h2>
+      <button id="restartBtn" class="secondary">Gerät neu starten</button>
+    </section>
+
+    <div id="toast" class="toast hidden"></div>
+  </main>
+
+  <footer>
+    Netzwerk-Reset am Gerät: Taste beim Einschalten 10 s gedrückt halten.
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

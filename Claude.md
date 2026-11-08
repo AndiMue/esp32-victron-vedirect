@@ -199,7 +199,8 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 | E-Paper CS / DC / RST | 5 / 13 / 4 |
 | E-Paper BUSY | 34 (reiner Eingang) |
 | I²C Reserve | 21 SDA, 22 SCL |
-| Reserve Eingänge | 35, 36, 39 (externer Pull-up nötig; 36/39 analog) |
+| Reset Btn | 35 | Pull high -> Btn schaltet auf Gnd
+| Reserve Eingänge | 36, 39 (externer Pull-up nötig; 36/39 analog) |
 | Nicht verwenden | 0, 2, 12, 14, 15 (Strapping/Bootsignale) |
 
 - **Board:** „MINI32 V1.0.0“ (ESP32-WROOM-32, D1-mini-Format, CH9102-USB). Beschriftung nur auf der **Unterseite** (von oben gesehen links/rechts vertauscht). JTAG-Namen: **TCK = GPIO13**, TMS = 14, TDI = 12, TDO = 15; SVP = 36, SVN = 39. **SD0 („SDD“)/SD1/SD2/SD3/CLK/CMD = Flash, nie verwenden.** „VCC“ = 5 V vom USB.
@@ -213,6 +214,33 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 - Darf manuelles Einschalten (z. B. Wechselrichter) die Schutzabschaltung überstimmen (Notbetrieb)? Vorschlag: nein, Schutz geht vor Bedienung.
 - Konkrete Schwellenwerte für SOC und Spannung sowie die Hysterese.
 - Welcher Bus für ein abgesetztes Bediengerät (z. B. RS485, CAN, I²C über längere Leitungen ist kritisch)?
+
+## WebUI (W-Stufen, ab 08.11.2026)
+
+### Grundsätze (Projektinhaber 08.11.2026)
+- WebUI wird **neu umgesetzt**; aus `ESP32_WebUI_AP_BASIS` nur sinnvolle Ideen übernehmen (TAR-Update der WebUI, kombiniertes Update, Build-Skripte, Partitionierung). Dort gefundene Probleme: Passwörter im HTML (`%PASS%`, `%MQTTPASS%`), offener AP, kein Login, Debug-Routen, doppelte Routen.
+- Die WebUI (inkl. OTA, AP, WLAN, MQTT) soll **Basis für weitere Projekte** sein (z. B. TempSens auf ESP8266). Code liegt in `lib/WebCore`, ESP32/ESP8266-Unterschiede gekapselt. **ESP8266-Variante folgt in einem eigenen Schritt** (`#error` als Platzhalter).
+- Sicherheit: Schutz gegen Angriffe übers Netz vollständig (WPA2-AP, Login, Passwörter verlassen nie das Gerät, `WiFi.persistent(false)`). Schutz gegen Auslesen des Flash nur mit ESP32-Flash-Verschlüsselung (unumkehrbar) → höchstens am Ende fürs fertige Gerät. ESP8266 hat dafür keine Hardware.
+- MQTT: Mosquitto → Node-RED und Homematic OpenCCU (nicht im Camper, dort kein WLAN).
+- Camper: dauerhafter AP muss möglich sein. Später: Shunt-Einstellungen per WebUI (braucht VE.Direct-HEX-Protokoll), Bediengerät evtl. per ESP-NOW.
+- Gewünscht: Live-Werte-Seite (Inhalt noch festlegen), alle 3 Relais schalten, Override, Schwellen konfigurieren, Logdatei (später), **Statusmeldungen auch in der WebUI**, Sicherung/Wiederherstellung der Einstellungen, Datum/Uhrzeit (evtl. RTC, Abgleich per WLAN/NTP), mDNS.
+
+### W1 (umgesetzt und getestet 08.11.2026)
+- `lib/WebCore`: `SettingsStore` (NVS), `WifiManager` (AP beim Erststart; sonst STA, nach 20 s AP-Rückfall, Wiederholung alle 60 s; Captive Portal; mDNS `ve-direct.local`; Fehlergrund der Verbindung), `WebUi` (eingebauter `WebServer`, Basic Auth `admin` + Gerätepasswort, Sperre 60 s nach 5 Fehlversuchen, API `/api/status`, `/api/wifi`, `/api/wifi/scan`, `/api/wifi/reset`, `/api/password`, `/api/restart`).
+- `data/`: `index.html`, `app.js`, `style.css` (Reiter Status/WLAN/Gerät, „Passwort anzeigen“, Rückmeldung nach dem Speichern). Hochladen: `pio run -t uploadfs`.
+- **Gerätepasswort** (AP + Login): beim Erststart zufällig, 8 Zeichen ohne verwechselbare Zeichen; steht auf dem E-Paper und im Monitor, solange es nicht geändert wurde.
+- **Reset-Taste IO35** (externer 10-kΩ-Pull-up nach 3,3 V, Taste nach GND): beim Einschalten 10 s halten, **dann loslassen** → WLAN + Gerätepasswort zurückgesetzt. Fehlersicher: dauerhaft Low (Pull-up fehlt, Taste klemmt) löst keinen Reset aus.
+- Partitionierung `partitions_ota_littlefs.csv`: 2 × 1,5 MB App, 896 KB LittleFS, 64 KB Core Dump. Firmware ca. 935 KB, RAM 26 %.
+- Test Projektinhaber: Weboberfläche auf PC und Handy, WLAN-Suche, Fehlermeldung bei falschem Passwort, Verbindung mit dem Heim-WLAN, `http://ve-direct.local`.
+- Beim Aufbau gefunden: IO35 ohne Pull-up löste bei jedem Start den Reset aus; MPPT-Simulator mit eigener USB-Versorgung ohne gemeinsame Masse → Prüfsummenfehler (LinkMonitor hat das korrekt als „instabil“ gemeldet). Abhilfe: GND direkt verbinden.
+
+### Nächste Schritte / Wünsche
+- **W2:** Updates (Firmware, WebUI als TAR, beides zusammen), Versionsanzeige, Rückfall bei fehlgeschlagenem Update, Relais vorher in sicheren Zustand.
+- **W3:** MQTT (Konfiguration, Werte veröffentlichen, R1-Befehl fürs BKW, Verhalten bei Verbindungsabbruch: Zustand halten).
+- **W4:** Projektseiten (Live-Werte, Relais, Override, Schwellen, **Statusmeldungen**), Sicherung/Wiederherstellung.
+- **E-Paper mit Symbolen (umgesetzt 08.11.2026):** Symbolleiste: WLAN-Balken (4 Stufen nach RSSI, durchgestrichen ohne WLAN), AP (schwarz = an, durchgestrichen = aus), MQTT (nur bei WLAN + eingerichtetem MQTT, ab W3), OVR (nur bei Override), Warndreieck (gefüllt = kritisch, leer = Warnung). Lade-/Entladepfeil am SOC (▲ lädt, ▼ entlädt, o Ruhe bei |I| < 0,05 A). Untere Zeile: Shunt/MPPT ● ok, ◐ instabil, ⊗ defekt. Textliche Statuszeile entfällt (Details → WebUI). Sofort aktualisiert: Symbole/Zustände/Relais; WLAN-Balken und Pfeil im 30-s-Takt mit den Werten.
+- MPPT-Simulator: GND war laut Projektinhaber immer verbunden; Ursache der Prüfsummenfehler nach der Umstellung auf USB-Versorgung noch offen → weiter beobachten.
+- Später: ESP8266-Variante von `lib/WebCore`, Uhrzeit (RTC/NTP), ESP-NOW-Bediengerät, Shunt-Konfiguration (HEX-Protokoll).
 
 ### Code-Stil
 - Aussagekräftige Kommentare im Code (Wunsch des Projektinhabers).

@@ -1,0 +1,118 @@
+/* VE.Direct WebUI – schlicht, handytauglich, ohne externe Schriften */
+:root {
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --text: #1d2733;
+  --muted: #5f6b7a;
+  --accent: #0b6bcb;
+  --danger: #c62828;
+  --warn-bg: #fff4d6;
+  --warn-text: #7a5200;
+  --border: #d5dbe3;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header {
+  background: var(--accent);
+  color: #fff;
+  padding: 12px 16px 0;
+}
+
+header h1 { margin: 0 0 8px; font-size: 1.3rem; }
+
+nav { display: flex; gap: 4px; }
+
+.tab {
+  background: transparent;
+  color: #dbe9f8;
+  border: none;
+  padding: 10px 14px;
+  font-size: 1rem;
+  cursor: pointer;
+  border-radius: 6px 6px 0 0;
+}
+.tab.active { background: var(--bg); color: var(--text); font-weight: 600; }
+
+main { max-width: 640px; margin: 0 auto; padding: 16px; }
+
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 16px 16px;
+}
+
+h2 { font-size: 1.05rem; margin: 18px 0 8px; }
+
+.grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  margin: 0;
+}
+.grid dt { color: var(--muted); }
+.grid dd { margin: 0; word-break: break-word; }
+
+label { display: block; margin: 12px 0; }
+label small { display: block; color: var(--muted); margin-top: 4px; }
+label.check { display: flex; gap: 8px; align-items: flex-start; }
+label.check.small { margin-top: -6px; font-size: 0.9rem; color: var(--muted); }
+
+input[type=text], input:not([type]), input[type=password] {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  margin-top: 4px;
+  font-size: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 16px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+button.secondary { background: #e3e9f0; color: var(--text); }
+button.danger    { background: var(--danger); }
+button:disabled  { opacity: 0.6; cursor: wait; }
+
+.scanlist { list-style: none; padding: 0; margin: 8px 0; }
+.scanlist li {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.scanlist li:hover { background: #eef4fb; }
+
+.banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; }
+.banner.warn { background: var(--warn-bg); color: var(--warn-text); }
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  background: #1d2733;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 6px;
+  max-width: 90%;
+}
+.toast.error { background: var(--danger); }
+
+.hidden { display: none !important; }
+
+footer { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 16px; }

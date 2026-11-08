@@ -1,0 +1,21 @@
+# Partitionierung für 4 MB Flash (ESP32-WROOM-32), Stand W1 (08.11.2026)
+#
+#   nvs      Einstellungen (WLAN, Passwort, später MQTT/Schwellen)
+#   otadata  merkt sich, welche App aktiv ist
+#   app0/1   zwei App-Bereiche à 1,5 MB -> Firmware-Update über die WebUI (W2)
+#            mit Rückfall auf die alte Firmware möglich
+#   spiffs   Dateisystem (LittleFS) für die WebUI-Dateien aus data/
+#            (Name "spiffs" ist der Standard, den LittleFS.begin() sucht)
+#   coredump Absturzbericht (64 KB): Bei einem Absturz speichert der ESP32
+#            hier den Zustand; auslesbar für die Fehlersuche im Feld.
+#
+# ACHTUNG: Ändert sich Lage/Größe von "spiffs", müssen die WebUI-Dateien
+# neu hochgeladen werden (pio run -t uploadfs). nvs bleibt unverändert.
+#
+# Name,   Type, SubType,  Offset,   Size
+nvs,      data, nvs,      0x9000,   0x5000
+otadata,  data, ota,      0xe000,   0x2000
+app0,     app,  ota_0,    0x10000,  0x180000
+app1,     app,  ota_1,    0x190000, 0x180000
+spiffs,   data, spiffs,   0x310000, 0xE0000
+coredump, data, coredump, 0x3F0000, 0x10000
