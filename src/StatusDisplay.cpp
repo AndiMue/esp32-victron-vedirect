@@ -324,6 +324,7 @@ void StatusDisplay::buildContent(const DisplayData& data, Content& out)
 
     // ---- Override, Warnsymbol ----
     out.overrideActive = data.overrideActive;
+    out.updateRunning  = data.updateRunning;
     out.warning = (s.severity == Severity::Critical) ? WarnCritical
                 : (s.severity == Severity::Warning)  ? WarnWarning
                                                      : WarnNone;
@@ -360,6 +361,7 @@ bool StatusDisplay::importantChange(const Content& a, const Content& b)
            a.mqttShown      != b.mqttShown ||
            a.mqttConnected  != b.mqttConnected ||
            a.overrideActive != b.overrideActive ||
+           a.updateRunning  != b.updateRunning ||
            a.warning        != b.warning ||
            a.linkShunt      != b.linkShunt ||
            a.linkMppt       != b.linkMppt ||
@@ -400,6 +402,10 @@ void StatusDisplay::render(const Content& c, bool fullRefresh)
         if (c.mqttShown)
         {
             drawTextBox(x, 2, "MQTT", c.mqttConnected, !c.mqttConnected);
+        }
+        if (c.updateRunning)
+        {
+            drawTextBox(92, 2, "UPD", true, false);   // Update läuft: Strom nicht trennen
         }
         if (c.overrideActive)
         {

@@ -154,6 +154,9 @@ void WebUi::serveFile(const String& path)
     }
 
     File f = LittleFS.open(file, "r");
+    // Nicht zwischenspeichern: Nach einem WebUI-Update soll der Browser nie
+    // mit einer alten app.js arbeiten (Finding 08.11.2026)
+    g_server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     g_server.streamFile(f, contentType(file));
     f.close();
 }
@@ -211,6 +214,23 @@ void WebUi::handleStatus()
     j += ",\"lastErrorCode\":" + String(st.lastFailReason);
     j += "}";
     j += ",\"defaultPassword\":" + String(st.defaultPassword ? "true" : "false");
+
+    // ---- W2: Versionen und Update-Zustand ----
+    const char* updState = "idle";
+    switch (m_update.state())
+    {
+        case UpdateManager::State::Idle:    updState = "idle";    break;
+        case UpdateManager::State::Running: updState = "running"; break;
+        case UpdateManager::State::Success: updState = "ok";      break;
+        case UpdateManager::State::Failed:  updState = "error";   break;
+    }
+    j += ",\"webui\":" + jsonString(webUiVersion());
+    j += ",\"update\":{";
+    j += "\"state\":"       + jsonString(updState);
+    j += ",\"message\":"    + jsonString(m_update.message());
+    j += ",\"rolledBack\":" + String(UpdateManager::rolledBack() ? "true" : "false");
+    j += ",\"trial\":"      + String(UpdateManager::onTrial() ? "true" : "false");
+    j += "}";
     if (m_extension)
     {
         const String extra = m_extension();
@@ -326,6 +346,92 @@ void WebUi::handleRestart()
 }
 
 /******************************************************************************
+ * Updates (W2)
+ ******************************************************************************/
+String WebUi::webUiVersion() const
+{
+    File f = LittleFS.open("/version.json", "r");
+    if (!f)
+    {
+        return "unbekannt";
+    }
+    const String content = f.readString();
+    f.close();
+    // Inhalt: {"version": "26.11.08-1612"} -> Wert herausschneiden
+    const int key = content.indexOf("\"version\"");
+    const int q1  = content.indexOf('"', content.indexOf(':', key) + 1);
+    const int q2  = content.indexOf('"', q1 + 1);
+    return (key >= 0 && q1 > 0 && q2 > q1) ? content.substring(q1 + 1, q2) : String("unbekannt");
+}
+
+/// Wird für jedes Stück der hochgeladenen Datei aufgerufen.
+void WebUi::handleUpload(UpdateManager::Kind kind)
+{
+    HTTPUpload& up = g_server.upload();
+
+    switch (up.status)
+    {
+        case UPLOAD_FILE_START:
+            // Login VOR dem ersten geschriebenen Byte prüfen
+            m_uploadAuthorized = !m_locked &&
+                g_server.authenticate(AdminUser, m_wifi->devicePassword().c_str());
+            if (m_uploadAuthorized)
+            {
+                m_updateRunning = true;
+                m_update.begin(kind);
+            }
+            break;
+
+        case UPLOAD_FILE_WRITE:
+            if (m_uploadAuthorized)
+            {
+                m_update.write(up.buf, up.currentSize);
+            }
+            break;
+
+        case UPLOAD_FILE_END:
+            if (m_uploadAuthorized)
+            {
+                m_update.end();
+                m_updateRunning = false;
+            }
+            break;
+
+        case UPLOAD_FILE_ABORTED:
+            if (m_uploadAuthorized)
+            {
+                m_update.abort("Verbindung unterbrochen");
+                m_updateRunning = false;
+            }
+            break;
+    }
+}
+
+/// Nach dem vollständigen Upload: Antwort an den Browser.
+void WebUi::finishUpload()
+{
+    if (!m_uploadAuthorized)
+    {
+        authorize();   // fordert Login an bzw. meldet Sperre
+        return;
+    }
+
+    const bool ok = m_update.state() == UpdateManager::State::Success;
+    String j = "{\"ok\":";
+    j += ok ? "true" : "false";
+    j += ",\"message\":" + jsonString(m_update.message());
+    j += ",\"restart\":" + String(m_update.restartRequired() ? "true" : "false");
+    j += "}";
+    sendJson(ok ? 200 : 400, j);
+
+    if (m_update.restartRequired())
+    {
+        m_restartPending = true;
+        m_restartAtMs = millis() + 1500;   // Antwort noch ausliefern
+    }
+}
+
+/******************************************************************************
  * Start / Schleife
  ******************************************************************************/
 void WebUi::begin(WifiManager& wifi, const char* deviceName, const char* firmwareVersion)
@@ -341,6 +447,14 @@ void WebUi::begin(WifiManager& wifi, const char* deviceName, const char* firmwar
     g_server.on("/api/wifi/reset", HTTP_POST, [this]() { handleWifiReset(); });
     g_server.on("/api/password",   HTTP_POST, [this]() { handlePassword(); });
     g_server.on("/api/restart",    HTTP_POST, [this]() { handleRestart(); });
+
+    // W2: Updates (erster Handler = Antwort, zweiter = Datenstücke)
+    g_server.on("/api/update/firmware", HTTP_POST, [this]() { finishUpload(); },
+                [this]() { handleUpload(UpdateManager::Kind::Firmware); });
+    g_server.on("/api/update/webui",    HTTP_POST, [this]() { finishUpload(); },
+                [this]() { handleUpload(UpdateManager::Kind::WebUi); });
+    g_server.on("/api/update/package",  HTTP_POST, [this]() { finishUpload(); },
+                [this]() { handleUpload(UpdateManager::Kind::Package); });
     g_server.onNotFound([this]() { handleNotFound(); });
 
     g_server.begin();

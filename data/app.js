@@ -86,6 +86,13 @@ async function refreshStatus() {
       : "aus";
     $("stHost").textContent = "http://" + w.hostname + ".local";
     $("stFw").textContent = s.firmware;
+    $("stWebui").textContent = s.webui;
+    $("upFw").textContent = s.firmware;
+    $("upWebui").textContent = s.webui;
+    $("upTrial").textContent = s.update.trial
+      ? "Neue Firmware läuft auf Probe (wird nach 60 s bestätigt)"
+      : "Firmware bestätigt";
+    $("rollbackWarning").classList.toggle("hidden", !s.update.rolledBack);
     $("stUptime").textContent = formatUptime(s.uptimeS);
     $("stHeap").textContent = Math.round(s.freeHeap / 1024) + " KB";
     $("pwWarning").classList.toggle("hidden", !s.defaultPassword);
@@ -208,6 +215,79 @@ $("pwForm").addEventListener("submit", async (ev) => {
   } catch (e) {
     toast(e.message, true);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Update (W2): Upload mit Fortschrittsanzeige, danach ggf. auf Neustart warten
+// ---------------------------------------------------------------------------
+function uploadFile(kind, file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    form.append("file", file, file.name);
+    xhr.open("POST", "/api/update/" + kind);
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable) {
+        const pct = Math.round((ev.loaded / ev.total) * 100);
+        $("uploadProgress").value = pct;
+        $("uploadText").textContent = "Hochladen … " + pct + " %";
+      }
+    };
+    xhr.onload = () => {
+      let json = {};
+      try { json = JSON.parse(xhr.responseText); } catch (e) { /* leer */ }
+      if (xhr.status === 200 && json.ok) resolve(json);
+      else reject(new Error(json.message || ("Fehler " + xhr.status)));
+    };
+    xhr.onerror = () => reject(new Error("Verbindung unterbrochen"));
+    xhr.send(form);
+  });
+}
+
+async function waitForRestart(oldFirmware) {
+  $("uploadText").textContent = "Gerät startet neu …";
+  await new Promise((res) => setTimeout(res, 8000));
+  for (let i = 0; i < 30; i++) {
+    try {
+      const s = await api("/api/status");
+      toast(s.firmware !== oldFirmware
+        ? "Neu gestartet. Firmware jetzt " + s.firmware
+        : "Neu gestartet. Firmware unverändert " + s.firmware);
+      $("uploadText").textContent = "Fertig.";
+      setTimeout(() => location.reload(), 1500);
+      return;
+    } catch (e) {
+      await new Promise((res) => setTimeout(res, 2000));
+    }
+  }
+  toast("Gerät nach 70 s nicht erreichbar. Bitte Seite manuell neu laden.", true);
+}
+
+document.querySelectorAll("button.upload").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const file = $(btn.dataset.input).files[0];
+    if (!file) { toast("Bitte zuerst eine Datei auswählen.", true); return; }
+    if (!confirm("„" + file.name + "“ jetzt aufspielen?")) return;
+
+    const oldFirmware = lastStatus ? lastStatus.firmware : "";
+    document.querySelectorAll("button.upload").forEach((b) => (b.disabled = true));
+    $("uploadBox").classList.remove("hidden");
+    $("uploadProgress").value = 0;
+    try {
+      const r = await uploadFile(btn.dataset.kind, file);
+      toast(r.message);
+      if (r.restart) {
+        await waitForRestart(oldFirmware);
+      } else {
+        $("uploadText").textContent = r.message;
+        setTimeout(() => location.reload(), 2000);
+      }
+    } catch (e) {
+      $("uploadText").textContent = "Fehler: " + e.message;
+      toast(e.message, true);
+    }
+    document.querySelectorAll("button.upload").forEach((b) => (b.disabled = false));
+  });
 });
 
 $("restartBtn").addEventListener("click", async () => {

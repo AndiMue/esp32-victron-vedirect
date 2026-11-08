@@ -14,6 +14,7 @@
       <button class="tab active" data-tab="status">Status</button>
       <button class="tab" data-tab="wifi">WLAN</button>
       <button class="tab" data-tab="device">Gerät</button>
+      <button class="tab" data-tab="update">Update</button>
     </nav>
   </header>
 
@@ -37,6 +38,7 @@
       <h2>Gerät</h2>
       <dl class="grid">
         <dt>Firmware</dt>       <dd id="stFw">–</dd>
+        <dt>WebUI</dt>          <dd id="stWebui">–</dd>
         <dt>Laufzeit</dt>       <dd id="stUptime">–</dd>
         <dt>Freier Speicher</dt><dd id="stHeap">–</dd>
       </dl>
@@ -92,6 +94,44 @@
 
       <h2>Neustart</h2>
       <button id="restartBtn" class="secondary">Gerät neu starten</button>
+    </section>
+
+    <!-- ===================== Update ===================== -->
+    <section id="tab-update" class="panel hidden">
+      <div id="rollbackWarning" class="banner warn hidden">
+        Die zuletzt aufgespielte Firmware lief nicht stabil. Es wurde automatisch auf die vorherige Firmware zurückgeschaltet.
+      </div>
+      <dl class="grid">
+        <dt>Firmware</dt> <dd id="upFw">–</dd>
+        <dt>WebUI</dt>    <dd id="upWebui">–</dd>
+        <dt>Zustand</dt>  <dd id="upTrial">–</dd>
+      </dl>
+
+      <p>Die Dateien erzeugt der Build automatisch im Ordner <code>.pio/build/esp32dev/</code>.</p>
+
+      <hr>
+      <h2>Paket (Firmware + WebUI)</h2>
+      <p>Empfohlen: <code>package_&lt;Version&gt;.tar</code>. Danach startet das Gerät neu.</p>
+      <input type="file" id="filePackage" accept=".tar">
+      <button class="upload" data-kind="package" data-input="filePackage">Paket hochladen</button>
+
+      <hr>
+      <h2>Nur Firmware</h2>
+      <p><code>firmware_&lt;Version&gt;.bin</code>. Danach startet das Gerät neu.</p>
+      <input type="file" id="fileFirmware" accept=".bin">
+      <button class="upload" data-kind="firmware" data-input="fileFirmware">Firmware hochladen</button>
+
+      <hr>
+      <h2>Nur WebUI</h2>
+      <p><code>webui_&lt;Version&gt;.tar</code>. Kein Neustart nötig.</p>
+      <input type="file" id="fileWebui" accept=".tar">
+      <button class="upload" data-kind="webui" data-input="fileWebui">WebUI hochladen</button>
+
+      <div id="uploadBox" class="hidden">
+        <progress id="uploadProgress" max="100" value="0"></progress>
+        <span id="uploadText"></span>
+      </div>
+      <p class="hint">Nach einem Firmware-Update läuft die neue Firmware zunächst auf Probe. Startet sie dreimal hintereinander nicht stabil (60 s), schaltet das Gerät automatisch auf die vorherige Firmware zurück.</p>
     </section>
 
     <div id="toast" class="toast hidden"></div>

@@ -231,6 +231,14 @@ void WifiManager::loop(uint32_t nowMs)
         g_dns.processNextRequest();
     }
 
+    // WLAN-Suche beendet (bzw. Zeit abgelaufen): automatisches
+    // Wiederverbinden wieder einschalten
+    if (m_scanPause && static_cast<int32_t>(nowMs - m_scanUntilMs) >= 0)
+    {
+        m_scanPause = false;
+        WiFi.setAutoReconnect(true);
+    }
+
     // Neue Konfiguration aus der WebUI anwenden
     if (m_reconfigure)
     {
@@ -269,8 +277,9 @@ void WifiManager::loop(uint32_t nowMs)
                 // WLAN nicht erreichbar -> AP als Rückfall
                 startAp();
                 m_state = NetState::Fallback;
-                m_stateSinceMs = nowMs;
-                m_lastRetryMs  = nowMs;
+                m_stateSinceMs    = nowMs;
+                m_lastRetryMs     = nowMs;
+                m_fallbackRetries = 0;
             }
             break;
 
@@ -296,8 +305,9 @@ void WifiManager::loop(uint32_t nowMs)
                 {
                     startAp();
                     m_state = NetState::Fallback;
-                    m_stateSinceMs = nowMs;
-                    m_lastRetryMs  = nowMs;
+                    m_stateSinceMs    = nowMs;
+                    m_lastRetryMs     = nowMs;
+                    m_fallbackRetries = 0;
                 }
             }
             break;
@@ -309,9 +319,14 @@ void WifiManager::loop(uint32_t nowMs)
                 m_stateSinceMs = nowMs;
                 ++m_connectCount;
             }
-            else if (static_cast<uint32_t>(nowMs - m_lastRetryMs) > RetryIntervalMs)
+            else if (!m_scanPause &&
+                     static_cast<uint32_t>(nowMs - m_lastRetryMs) >
+                         (m_fallbackRetries == 0 ? FirstRetryMs : RetryIntervalMs))
             {
-                // Erneuter Versuch, AP bleibt dabei an
+                // Erneuter Versuch, AP bleibt dabei an. Der erste kommt
+                // schon nach FirstRetryMs (Router lehnen direkt nach einem
+                // Neustart manchmal kurz ab), danach alle RetryIntervalMs.
+                ++m_fallbackRetries;
                 m_lastRetryMs = nowMs;
                 WiFi.disconnect(false);
                 g_lastReason = 0;
@@ -384,6 +399,11 @@ void WifiManager::prepareScan()
     }
     if (m_state == NetState::Connecting || m_state == NetState::Fallback)
     {
+        // Automatisches Wiederverbinden für die Dauer der Suche pausieren,
+        // sonst bricht es die Suche ab (Finding 08.11.2026)
+        WiFi.setAutoReconnect(false);
+        m_scanPause   = true;
+        m_scanUntilMs = millis() + ScanPauseMs;
         WiFi.disconnect(false); // laufenden Verbindungsversuch anhalten
         if (m_state == NetState::Connecting)
         {

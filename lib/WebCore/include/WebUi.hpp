@@ -25,13 +25,22 @@
  *   POST /api/wifi/reset    WLAN-Zugangsdaten löschen
  *   POST /api/restart       Neustart
  *
+ * API (W2, Updates; Datei als multipart/form-data, Feld "file"):
+ *   POST /api/update/firmware   firmware.bin              -> Neustart
+ *   POST /api/update/webui      webui_*.tar               -> kein Neustart
+ *   POST /api/update/package    package_*.tar             -> Neustart
+ *   Ergebnis und Versionen auch in /api/status ("update", "firmware", "webui").
+ *
  * Nur aus EINER Task verwenden (Web-Task): begin(), dann loop().
  ******************************************************************************/
 
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
 #include <functional>
+
+#include "UpdateManager.hpp"
 
 class WifiManager;
 
@@ -51,6 +60,9 @@ public:
 
     void setStatusExtension(StatusExtension extension) { m_extension = extension; }
 
+    /// Läuft gerade ein Update? (aus anderen Tasks lesbar, z. B. Display)
+    bool updateRunning() const { return m_updateRunning.load(); }
+
     /// Hilfsfunktion: Text als JSON-String (mit Anführungszeichen, escaped).
     static String jsonString(const String& text);
 
@@ -68,6 +80,13 @@ private:
     void handlePassword();
     void handleWifiReset();
     void handleRestart();
+    void handleUpload(UpdateManager::Kind kind);
+    void finishUpload();
+    String webUiVersion() const;
+
+    UpdateManager     m_update;
+    bool              m_uploadAuthorized = false;
+    std::atomic<bool> m_updateRunning{false};
 
     WifiManager*    m_wifi = nullptr;
     String          m_deviceName;

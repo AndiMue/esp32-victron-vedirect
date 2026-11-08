@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Generiert bei jedem Build (tools/build_version.py)
+src/BuildVersion.h
+data/version.json

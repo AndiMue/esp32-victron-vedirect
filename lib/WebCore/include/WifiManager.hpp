@@ -69,8 +69,13 @@ class WifiManager
 {
 public:
 
-    static constexpr uint32_t ConnectTimeoutMs = 20000;
-    static constexpr uint32_t RetryIntervalMs  = 60000;
+    /// Geduld beim Verbinden, bevor der AP als Rückfall startet. 30 s, weil
+    /// manche Router (Fritz!Box) direkt nach einem Neustart des ESP32 den
+    /// ersten Versuch ablehnen (Code 202) (Finding 08.11.2026).
+    static constexpr uint32_t ConnectTimeoutMs = 30000;
+    static constexpr uint32_t FirstRetryMs     = 15000;   ///< 1. Versuch im Rückfall
+    static constexpr uint32_t RetryIntervalMs  = 60000;   ///< weitere Versuche
+    static constexpr uint32_t ScanPauseMs      = 15000;   ///< Wiederverbinden während Suche pausiert
     static constexpr uint32_t LostToFallbackMs = 20000;
     static constexpr size_t   MinPasswordLength = 8;   ///< WPA2-Minimum
 
@@ -139,6 +144,9 @@ private:
     bool     m_lost            = false;
     uint32_t m_connectCount    = 0;
     uint32_t m_attempt         = 0;
+    uint32_t m_fallbackRetries = 0;
+    bool     m_scanPause       = false;
+    uint32_t m_scanUntilMs     = 0;
 
     NetStatus m_status;
 };

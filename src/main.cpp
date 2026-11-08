@@ -44,8 +44,10 @@
 
 #include <LittleFS.h>
 
+#include "BuildVersion.h"   // FW_VERSION, erzeugt von tools/build_version.py
 #include "RelayDriver.hpp"
 #include "StatusDisplay.hpp"
+#include "UpdateManager.hpp"
 #include "WebUi.hpp"
 #include "WifiManager.hpp"
 
@@ -86,7 +88,7 @@ constexpr uint32_t WatchdogTimeoutS = 10;
 
 /// WebUI (Stufe W1)
 const char* const DeviceName      = "VE.Direct Steuergerät";
-const char* const FirmwareVersion = "W1 " __DATE__ " " __TIME__;
+const char* const FirmwareVersion = FW_VERSION;   ///< JJ.MM.TT-HHMM des Builds
 const char* const DefaultHostname = "ve-direct";   ///< http://ve-direct.local
 const char* const ApPrefix        = "VE-Direct";   ///< AP-Name: VE-Direct-XXXX
 constexpr uint32_t WebTaskStack   = 8192;
@@ -669,6 +671,7 @@ DisplayData makeDisplayData()
     data.apActive       = net.apActive;
     data.mqttConfigured = false;   // MQTT folgt in W3
     data.mqttConnected  = false;
+    data.updateRunning  = g_webUi.updateRunning();
 
     data.showSetup = net.apActive && net.defaultPassword && net.displayPassword[0] != '\0';
     if (data.showSetup)
@@ -695,11 +698,21 @@ void webTask(void*)
     g_wifi.begin(DefaultHostname, ApPrefix);
     g_webUi.begin(g_wifi, DeviceName, FirmwareVersion);
 
+    bool stableConfirmed = false;
+
     for (;;)
     {
         const uint32_t now = millis();
         g_wifi.loop(now);
         g_webUi.loop(now);
+
+        // W2: Nach 60 s stabilem Lauf gilt eine neue Firmware als gut
+        // (sonst Rückfall auf die vorherige, siehe UpdateManager)
+        if (!stableConfirmed && now >= UpdateManager::StableAfterMs)
+        {
+            UpdateManager::confirmStable();
+            stableConfirmed = true;
+        }
 
         const NetStatus status = g_wifi.status();
         portENTER_CRITICAL(&g_statusLock);
@@ -1239,6 +1252,21 @@ void handleCommandLine(char* line)
 
     Serial.printf("> %s\n", line);
 
+    // ---- TESTFUNKTION (08.11.2026), SPÄTER ENTFERNEN ----
+    // "absturz": löst absichtlich einen Absturz aus (Panic -> Neustart,
+    // Absturzbericht im Core-Dump-Bereich). Zum Testen des Rückfalls nach
+    // einem Update: dreimal innerhalb von 60 s nach dem Start auslösen.
+    // Bewusst NICHT gespeichert/automatisch, damit auch die Firmware, auf die
+    // zurückgeschaltet wird, nicht in eine Absturzschleife gerät.
+    if (std::strcmp(line, "absturz") == 0)
+    {
+        Serial.printf("[TEST] Absturz wird ausgelöst (Laufzeit %lu s) ...\n",
+                      static_cast<unsigned long>(millis() / 1000));
+        Serial.flush();
+        delay(100);
+        abort();
+    }
+
     // ---- Anzeige-Befehle (direkt in der Logger-Task) ----
     if (std::strcmp(line, "bloecke ein") == 0 || std::strcmp(line, "blöcke ein") == 0)
     {
@@ -1447,8 +1475,24 @@ void setup()
 
     Serial.println();
     Serial.println("--------------------------------------------------");
-    Serial.println("Victron VE.Direct Reader - Stufe W1 (WLAN, WebUI)");
+    Serial.println("Victron VE.Direct Reader - Stufe W2 (WLAN, WebUI, Updates)");
     Serial.printf("Firmware: %s\n", FirmwareVersion);
+
+    // W2: Probestart nach Update prüfen. Lief die neue Firmware zu oft nicht
+    // stabil, wird hier auf die vorherige zurückgeschaltet (Neustart).
+    UpdateManager::checkTrialBoot();
+    if (UpdateManager::onTrial())
+    {
+        Serial.printf("[UPDATE] Neue Firmware läuft auf Probe: Start %lu von %u "
+                      "(bestätigt nach 60 s stabilem Lauf, sonst Rückfall)\n",
+                      static_cast<unsigned long>(UpdateManager::trialBoots()),
+                      static_cast<unsigned>(UpdateManager::MaxTrialBoots));
+    }
+    if (UpdateManager::rolledBack())
+    {
+        Serial.println("[UPDATE] ACHTUNG: Die zuletzt aufgespielte Firmware lief nicht stabil, "
+                       "es wurde auf die vorherige zurückgeschaltet.");
+    }
     for (size_t i = 0; i < RelayCount; ++i)
     {
         Serial.printf("Relais R%u: GPIO%u, %s\n", static_cast<unsigned>(i + 1),

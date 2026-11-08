@@ -65,6 +65,7 @@ struct DisplayData
     bool        apActive       = false;
     bool        mqttConfigured = false;  ///< ab W3
     bool        mqttConnected  = false;  ///< ab W3
+    bool        updateRunning  = false;  ///< W2: Update läuft ("UPD")
 
     // Ersteinrichtung (W1): AP-Name + Startpasswort statt Verbindungszeile
     bool        showSetup = false;
@@ -122,6 +123,7 @@ private:
         bool    mqttShown;
         bool    mqttConnected;
         bool    overrideActive;
+        bool    updateRunning;
         uint8_t warning;         ///< Warning
         uint8_t linkShunt;       ///< LinkState
         uint8_t linkMppt;        ///< LinkState

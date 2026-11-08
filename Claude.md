@@ -235,12 +235,22 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 - Beim Aufbau gefunden: IO35 ohne Pull-up löste bei jedem Start den Reset aus; MPPT-Simulator mit eigener USB-Versorgung ohne gemeinsame Masse → Prüfsummenfehler (LinkMonitor hat das korrekt als „instabil“ gemeldet). Abhilfe: GND direkt verbinden.
 
 ### Nächste Schritte / Wünsche
-- **W2:** Updates (Firmware, WebUI als TAR, beides zusammen), Versionsanzeige, Rückfall bei fehlgeschlagenem Update, Relais vorher in sicheren Zustand.
+- **W2 (umgesetzt 08.11.2026, Browser-Test durch Projektinhaber offen):** Updates über den Browser (Reiter „Update“, nur mit Login):
+  - `firmware_<V>.bin` (direkt in den freien App-Bereich, nur gültiges ESP32-Programm, Kopf 0xE9) → Neustart; `webui_<V>.tar` (web/…) → kein Neustart; `package_<V>.tar` (firmware.bin + web/…) → Neustart.
+  - TAR wird während des Uploads nach `/_new` entpackt und erst bei Vollständigkeit übernommen.
+  - **Probestart:** neue Firmware läuft auf Probe; 3 Starts ohne 60 s stabilen Lauf → Rückfall auf die vorherige Firmware (eigene Lösung, `UpdateManager`; der Hersteller-Rückfall ist im Arduino-Paket nicht aktiv). Auch 3 schnelle Resets von Hand lösen den Rückfall aus.
+  - Relais laufen während des Uploads weiter; der Neustart schaltet sie sicher ab, danach Startzustand. E-Paper zeigt „UPD“ während des Uploads.
+  - Version `JJ.MM.TT-HHMM` automatisch (`tools/build_version.py` → `src/BuildVersion.h`, `data/version.json`, beide in `.gitignore`). `tools/build_packages.py` legt die drei Update-Dateien in `.pio/build/esp32dev/`.
+  - Browser-Test Projektinhaber 08.11.2026: WebUI- und Paket-Update funktionieren. Finding: Ein Paket unter „Nur WebUI“ wurde angenommen (WebUI übernommen, Firmware still ignoriert) → behoben, wird jetzt mit Meldung abgelehnt.
+  - Rückfall-Test Projektinhaber 08.11.2026 erfolgreich (3 × `absturz` → Rückfall auf die vorherige Firmware). Finding danach: Nach dem erneuten Paket-Update war das WLAN eine Weile nicht erreichbar (nur AP), WLAN-Suche ging nicht, Zugangsdaten schienen zu fehlen. Ursache: Fritz!Box lehnt den ersten Anmeldeversuch nach einem Neustart ab (Code 202) → 20 s Geduld zu kurz → AP-Rückfall mit Wiederholung erst nach 60 s; automatisches Wiederverbinden störte die Suche; Browser hielt die alte `app.js` im Cache. Behoben: 30 s Geduld, erster Wiederholversuch nach 15 s, Wiederverbinden während der Suche pausiert, WebUI-Dateien mit `Cache-Control: no-cache`.
+  - **TESTFUNKTION `absturz`** im seriellen Monitor (löst `abort()` aus) zum Testen des Rückfalls → **später wieder entfernen** (in `main.cpp`, `handleCommandLine`).
+  - **Kein ArduinoOTA** (Entscheidung Projektinhaber 08.11.2026). USB bleibt in der Entwicklung für Debug-Ausgaben und als Rettungsweg. Spätere Unterscheidung Develop/Serie möglich.
 - **W3:** MQTT (Konfiguration, Werte veröffentlichen, R1-Befehl fürs BKW, Verhalten bei Verbindungsabbruch: Zustand halten).
 - **W4:** Projektseiten (Live-Werte, Relais, Override, Schwellen, **Statusmeldungen**), Sicherung/Wiederherstellung.
 - **E-Paper mit Symbolen (umgesetzt 08.11.2026):** Symbolleiste: WLAN-Balken (4 Stufen nach RSSI, durchgestrichen ohne WLAN), AP (schwarz = an, durchgestrichen = aus), MQTT (nur bei WLAN + eingerichtetem MQTT, ab W3), OVR (nur bei Override), Warndreieck (gefüllt = kritisch, leer = Warnung). Lade-/Entladepfeil am SOC (▲ lädt, ▼ entlädt, o Ruhe bei |I| < 0,05 A). Untere Zeile: Shunt/MPPT ● ok, ◐ instabil, ⊗ defekt. Textliche Statuszeile entfällt (Details → WebUI). Sofort aktualisiert: Symbole/Zustände/Relais; WLAN-Balken und Pfeil im 30-s-Takt mit den Werten.
 - MPPT-Simulator: GND war laut Projektinhaber immer verbunden; Ursache der Prüfsummenfehler nach der Umstellung auf USB-Versorgung noch offen → weiter beobachten.
 - Später: ESP8266-Variante von `lib/WebCore`, Uhrzeit (RTC/NTP), ESP-NOW-Bediengerät, Shunt-Konfiguration (HEX-Protokoll).
+- **Am Ende: kurze Anleitung** für Bedienung (Ersteinrichtung, WLAN, Passwort, Reset-Taste, Updates, Relais/Override) – Wunsch Projektinhaber 08.11.2026.
 
 ### Code-Stil
 - Aussagekräftige Kommentare im Code (Wunsch des Projektinhabers).

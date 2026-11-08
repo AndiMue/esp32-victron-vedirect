@@ -115,4 +115,14 @@ button:disabled  { opacity: 0.6; cursor: wait; }
 
 .hidden { display: none !important; }
 
+input[type=file] { display: block; margin: 8px 0; max-width: 100%; }
+progress { width: 100%; height: 18px; margin-top: 12px; }
+.hint { color: var(--muted); font-size: 0.9rem; margin-top: 18px; }
+
+/* Trennstriche zwischen den Update-Bereichen */
+hr { border: none; border-top: 2px solid var(--border); margin: 20px 0 0; }
+
+/* Hinweis "Ein Passwort ist gespeichert" hervorheben */
+#wifiPassHint { font-weight: 600; color: var(--text); }
+
 footer { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 16px; }
