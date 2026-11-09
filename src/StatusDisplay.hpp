@@ -20,7 +20,7 @@
  *
  *   WLAN   4 Balken nach Signalstärke; ohne WLAN leer + durchgestrichen
  *   AP     schwarz = an, durchgestrichen = aus
- *   MQTT   nur sichtbar bei WLAN + eingerichtetem MQTT (ab W3);
+ *   MQTT   sichtbar, sobald MQTT eingerichtet ist (auch ohne WLAN);
  *          schwarz = verbunden, durchgestrichen = nicht verbunden
  *   OVR    nur bei aktivem Override
  *   ⚠      gefüllt = kritischer Fehler, leer = Warnung, sonst nicht sichtbar

@@ -6,6 +6,7 @@
 
 #include "WebUi.hpp"
 
+#include "MqttManager.hpp"
 #include "WifiManager.hpp"
 
 #if defined(ESP32)
@@ -231,6 +232,10 @@ void WebUi::handleStatus()
     j += ",\"rolledBack\":" + String(UpdateManager::rolledBack() ? "true" : "false");
     j += ",\"trial\":"      + String(UpdateManager::onTrial() ? "true" : "false");
     j += "}";
+    if (m_mqtt)
+    {
+        j += ",\"mqtt\":" + mqttStatusJson();
+    }
     if (m_extension)
     {
         const String extra = m_extension();
@@ -432,6 +437,90 @@ void WebUi::finishUpload()
 }
 
 /******************************************************************************
+ * MQTT (W3)
+ ******************************************************************************/
+String WebUi::mqttStatusJson() const
+{
+    const MqttStatus st = m_mqtt->status();
+    const MqttConfig cfg = m_mqtt->config();
+    const char* state = "disabled";
+    switch (st.state)
+    {
+        case MqttState::Disabled:   state = "disabled";   break;
+        case MqttState::NoNetwork:  state = "no_network"; break;
+        case MqttState::Connecting: state = "connecting"; break;
+        case MqttState::Connected:  state = "connected";  break;
+        case MqttState::Error:      state = "error";      break;
+    }
+    String j = "{";
+    j += "\"state\":"         + jsonString(state);
+    j += ",\"error\":"        + jsonString(st.lastError);
+    j += ",\"broker\":"       + jsonString(cfg.host.length() ? cfg.host + ":" + String(cfg.port) : String(""));
+    j += ",\"baseTopic\":"    + jsonString(cfg.baseTopic);
+    j += ",\"connectCount\":" + String(st.connectCount);
+    j += ",\"publishCount\":" + String(st.publishCount);
+    j += ",\"receiveCount\":" + String(st.receiveCount);
+    j += ",\"lastPublishAgoS\":" + String(st.lastPublishMs ? (millis() - st.lastPublishMs) / 1000 : 0);
+    j += "}";
+    return j;
+}
+
+void WebUi::handleMqttGet()
+{
+    if (!authorize()) return;
+    const MqttConfig c = m_mqtt->config();
+    String j = "{";
+    j += "\"enabled\":"      + String(c.enabled ? "true" : "false");
+    j += ",\"host\":"        + jsonString(c.host);
+    j += ",\"port\":"        + String(c.port);
+    j += ",\"user\":"        + jsonString(c.user);
+    j += ",\"passwordSet\":" + String(m_mqtt->passwordSet() ? "true" : "false");
+    j += ",\"baseTopic\":"   + jsonString(c.baseTopic);
+    j += ",\"intervalS\":"   + String(c.intervalS);
+    j += ",\"clientId\":"    + jsonString(c.clientId);
+    j += ",\"status\":"      + mqttStatusJson();
+    j += "}";
+    sendJson(200, j);
+}
+
+void WebUi::handleMqttPost()
+{
+    if (!authorize()) return;
+    MqttConfig c;
+    c.enabled   = g_server.arg("enabled") == "1" || g_server.arg("enabled") == "true";
+    c.host      = g_server.arg("host");
+    c.host.trim();
+    c.port      = static_cast<uint16_t>(g_server.arg("port").toInt());
+    c.user      = g_server.arg("user");
+    c.password  = g_server.arg("password");   // leer = behalten
+    c.baseTopic = g_server.arg("baseTopic");
+    c.intervalS = static_cast<uint32_t>(g_server.arg("intervalS").toInt());
+    c.clientId  = g_server.arg("clientId");
+    c.clientId.trim();
+
+    if (!m_mqtt->setConfig(c))
+    {
+        sendJson(400, "{\"ok\":false,\"error\":\"Ungültig: Broker fehlt, Port 0, Intervall nicht 1–3600 s oder Basis-Topic leer/mit # bzw. +\"}");
+        return;
+    }
+    sendJson(200, "{\"ok\":true}");
+}
+
+void WebUi::handleMqttTest()
+{
+    if (!authorize()) return;
+    m_mqtt->reconnectNow();
+    sendJson(200, "{\"ok\":true}");
+}
+
+void WebUi::handleMqttReset()
+{
+    if (!authorize()) return;
+    m_mqtt->resetConfig();
+    sendJson(200, "{\"ok\":true}");
+}
+
+/******************************************************************************
  * Start / Schleife
  ******************************************************************************/
 void WebUi::begin(WifiManager& wifi, const char* deviceName, const char* firmwareVersion)
@@ -447,6 +536,15 @@ void WebUi::begin(WifiManager& wifi, const char* deviceName, const char* firmwar
     g_server.on("/api/wifi/reset", HTTP_POST, [this]() { handleWifiReset(); });
     g_server.on("/api/password",   HTTP_POST, [this]() { handlePassword(); });
     g_server.on("/api/restart",    HTTP_POST, [this]() { handleRestart(); });
+
+    // W3: MQTT
+    if (m_mqtt)
+    {
+        g_server.on("/api/mqtt",       HTTP_GET,  [this]() { handleMqttGet(); });
+        g_server.on("/api/mqtt",       HTTP_POST, [this]() { handleMqttPost(); });
+        g_server.on("/api/mqtt/test",  HTTP_POST, [this]() { handleMqttTest(); });
+        g_server.on("/api/mqtt/reset", HTTP_POST, [this]() { handleMqttReset(); });
+    }
 
     // W2: Updates (erster Handler = Antwort, zweiter = Datenstücke)
     g_server.on("/api/update/firmware", HTTP_POST, [this]() { finishUpload(); },

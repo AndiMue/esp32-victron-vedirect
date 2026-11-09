@@ -319,7 +319,9 @@ void StatusDisplay::buildContent(const DisplayData& data, Content& out)
         out.wifiBars = (r >= -55) ? 4 : (r >= -65) ? 3 : (r >= -75) ? 2 : (r >= -85) ? 1 : 0;
     }
     out.apActive      = data.apActive;
-    out.mqttShown     = data.wifiConnected && data.mqttConfigured;
+    // MQTT-Symbol, sobald MQTT eingerichtet ist – auch ohne WLAN, dann
+    // durchgestrichen (Projektinhaber 09.11.2026, z. B. Camper ohne Router)
+    out.mqttShown     = data.mqttConfigured;
     out.mqttConnected = out.mqttShown && data.mqttConnected;
 
     // ---- Override, Warnsymbol ----

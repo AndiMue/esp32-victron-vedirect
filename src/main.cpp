@@ -45,6 +45,7 @@
 #include <LittleFS.h>
 
 #include "BuildVersion.h"   // FW_VERSION, erzeugt von tools/build_version.py
+#include "MqttManager.hpp"
 #include "RelayDriver.hpp"
 #include "StatusDisplay.hpp"
 #include "UpdateManager.hpp"
@@ -297,6 +298,7 @@ ControlSnapshot g_control;             ///< geschützt durch g_statusLock
  ******************************************************************************/
 WifiManager g_wifi;
 WebUi       g_webUi;
+MqttManager g_mqtt;   ///< W3: loop/publish nur in der mqttTask; Konfiguration/Status threadsicher
 NetStatus   g_netStatus;   ///< Kopie für Logger/Display, geschützt durch g_statusLock
 
 NetStatus readNetStatus()
@@ -669,8 +671,9 @@ DisplayData makeDisplayData()
     data.wifiConnected  = net.staConnected;
     data.wifiRssi       = net.rssi;
     data.apActive       = net.apActive;
-    data.mqttConfigured = false;   // MQTT folgt in W3
-    data.mqttConnected  = false;
+    const MqttConfig mqttCfg = g_mqtt.config();
+    data.mqttConfigured = mqttCfg.enabled && mqttCfg.host.length() > 0;
+    data.mqttConnected  = g_mqtt.status().state == MqttState::Connected;
     data.updateRunning  = g_webUi.updateRunning();
 
     data.showSetup = net.apActive && net.defaultPassword && net.displayPassword[0] != '\0';
@@ -696,6 +699,7 @@ void webTask(void*)
     LittleFS.begin(true);
 
     g_wifi.begin(DefaultHostname, ApPrefix);
+    g_webUi.setMqtt(&g_mqtt);   // W3: MQTT-Reiter und /api/mqtt
     g_webUi.begin(g_wifi, DeviceName, FirmwareVersion);
 
     bool stableConfirmed = false;
@@ -720,6 +724,267 @@ void webTask(void*)
         portEXIT_CRITICAL(&g_statusLock);
 
         vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+/******************************************************************************
+ * MQTT-Task (Stufe W3)
+ *
+ * Topics (Basis-Topic einstellbar, Standard "vedirect"), Projektinhaber
+ * 09.11.2026: getrennte JSON je Bereich, alle retained:
+ *   <base>/status           online / offline (Letzter Wille)
+ *   <base>/battery          {"soc":..,"voltage":..,"current":..,"power":.., ...}
+ *   <base>/pv               {"power":..,"voltage":..,"state":"..", ...}
+ *   <base>/relays           {"r1":"ON","r2":..,"r3":..,"override":"OFF", ...}
+ *   <base>/system           {"faults":"0x..","severity":"..","shunt":"ok", ...}
+ *   <base>/command-result   Rückmeldung zu Befehlen (nicht retained)
+ * Befehle (ON/OFF, auch 1/0, true/false):
+ *   <base>/relay/r1-set, r2-set, r3-set, <base>/override-set
+ * Ungültige Werte werden als null gesendet (nie 0).
+ *
+ * Eigene Task: Ein Verbindungsversuch zu einem nicht erreichbaren Broker
+ * blockiert einige Sekunden. Nicht vom Watchdog überwacht.
+ ******************************************************************************/
+constexpr uint32_t    MqttTaskStack    = 6144;
+constexpr UBaseType_t MqttTaskPriority = 1;
+
+/// Messwert als JSON-Zahl, ungültig = null.
+String jsonNumber(const Reading& r, unsigned decimals)
+{
+    if (!r.valid)
+    {
+        return String("null");
+    }
+    if (decimals == 0)
+    {
+        // String(float, 0) liefert " 0" mit führendem Leerzeichen (Finding 09.11.2026)
+        return String(static_cast<long>(lroundf(r.value)));
+    }
+    return String(r.value, decimals);
+}
+
+const char* onOff(bool on) { return on ? "ON" : "OFF"; }
+
+const char* linkText(const SystemState& s, uint32_t missingMask, uint32_t unstableMask)
+{
+    if (s.faults & missingMask)  return "defekt";
+    if (s.faults & unstableMask) return "instabil";
+    return "ok";
+}
+
+String buildBatteryJson(const SystemState& s)
+{
+    const char* source = !s.batteryVoltage.valid ? "none"
+                       : (s.batteryVoltage.source == ValueSource::PvCharger ? "mppt" : "shunt");
+    String j = "{";
+    j += "\"soc\":"               + jsonNumber(s.stateOfCharge, 1);
+    j += ",\"voltage\":"          + jsonNumber(s.batteryVoltage, 3);
+    j += ",\"voltageSource\":\""  + String(source) + "\"";
+    j += ",\"current\":"          + jsonNumber(s.batteryCurrent, 3);
+    j += ",\"power\":"            + jsonNumber(s.batteryPower, 0);
+    j += ",\"consumedAh\":"       + jsonNumber(s.consumedAmpHours, 3);
+    j += ",\"timeToGoMin\":"      + jsonNumber(s.timeToGo, 0);
+    j += ",\"timeToGoInfinite\":" + String(s.timeToGoInfinite ? "true" : "false");
+    j += "}";
+    return j;
+}
+
+String buildPvJson(const SystemState& s)
+{
+    String j = "{";
+    j += "\"power\":"          + jsonNumber(s.pvPower, 0);
+    j += ",\"voltage\":"       + jsonNumber(s.pvVoltage, 3);
+    j += ",\"yieldTodayKWh\":" + jsonNumber(s.yieldToday, 2);
+    j += ",\"state\":"         + (s.chargerStateText ? WebUi::jsonString(s.chargerStateText) : String("null"));
+    j += ",\"stateCode\":"     + (s.chargerState >= 0 ? String(s.chargerState) : String("null"));
+    j += ",\"errorCode\":"     + (s.pvErrorCode >= 0 ? String(s.pvErrorCode) : String("null"));
+    j += "}";
+    return j;
+}
+
+String buildRelaysJson(const ControlSnapshot& c)
+{
+    String j = "{";
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const String key = "r" + String(i + 1);
+        if (i > 0) j += ",";
+        j += "\"" + key + "\":\"" + (c.enabled[i] ? onOff(c.relays[i].on) : "DISABLED") + "\"";
+        j += ",\"" + key + "Name\":"   + WebUi::jsonString(c.names[i] ? c.names[i] : "");
+        j += ",\"" + key + "Locked\":" + String(c.relays[i].locked ? "true" : "false");
+        j += ",\"" + key + "Wanted\":" + String(c.relays[i].requested ? "true" : "false");
+        j += ",\"" + key + "Reason\":" + WebUi::jsonString(c.relays[i].reason ? c.relays[i].reason : "");
+    }
+    j += ",\"override\":\"" + String(onOff(c.overrideActive)) + "\"";
+    j += "}";
+    return j;
+}
+
+String buildSystemJson(const SystemState& s, const NetStatus& net)
+{
+    char faults[12];
+    snprintf(faults, sizeof(faults), "0x%08lX", static_cast<unsigned long>(s.faults));
+
+    const char* severity = "none";
+    switch (s.severity)
+    {
+        case Severity::Info:     severity = "info";     break;
+        case Severity::Warning:  severity = "warning";  break;
+        case Severity::Critical: severity = "critical"; break;
+        default: break;
+    }
+
+    String texts = "[";
+    bool first = true;
+    for (unsigned bit = 0; bit < SystemFault::BitCount; ++bit)
+    {
+        const uint32_t mask = 1u << bit;
+        if (s.faults & mask)
+        {
+            if (!first) texts += ",";
+            texts += WebUi::jsonString(SystemEvaluator::faultText(mask));
+            first = false;
+        }
+    }
+    texts += "]";
+
+    String j = "{";
+    j += "\"faults\":\""    + String(faults) + "\"";
+    j += ",\"severity\":\"" + String(severity) + "\"";
+    j += ",\"faultTexts\":" + texts;
+    j += ",\"shunt\":\""    + String(linkText(s, SystemFault::BatteryMonitorMissing | SystemFault::MultipleBatteryMonitors,
+                                               SystemFault::BatteryLinkUnstable)) + "\"";
+    j += ",\"mppt\":\""     + String(linkText(s, SystemFault::PvChargerMissing | SystemFault::MultiplePvChargers,
+                                               SystemFault::PvLinkUnstable)) + "\"";
+    j += ",\"firmware\":\"" + String(FirmwareVersion) + "\"";
+    j += ",\"uptimeS\":"    + String(millis() / 1000);
+    j += ",\"rssi\":"       + String(net.rssi);
+    j += "}";
+    return j;
+}
+
+/// "ON"/"OFF", "1"/"0", "true"/"false" (Groß/klein egal). -1 = ungültig.
+int parseOnOff(String payload)
+{
+    payload.trim();
+    payload.toUpperCase();
+    if (payload == "ON"  || payload == "1" || payload == "TRUE"  || payload == "EIN") return 1;
+    if (payload == "OFF" || payload == "0" || payload == "FALSE" || payload == "AUS") return 0;
+    return -1;
+}
+
+/// Eingehender MQTT-Befehl -> Befehls-Queue der systemTask (Quelle MQTT).
+void onMqttMessage(const String& subtopic, const String& payload)
+{
+    const int value = parseOnOff(payload);
+    ControlCommand command;
+    command.source = CommandSource::Mqtt;
+
+    if (subtopic == "override-set")
+    {
+        command.kind = CommandKind::Override;
+    }
+    else if (subtopic == "relay/r1-set") { command.kind = CommandKind::Relay; command.relay = RelayId::Main; }
+    else if (subtopic == "relay/r2-set") { command.kind = CommandKind::Relay; command.relay = RelayId::Light; }
+    else if (subtopic == "relay/r3-set") { command.kind = CommandKind::Relay; command.relay = RelayId::Fridge; }
+    else
+    {
+        return;   // fremdes Topic
+    }
+
+    if (value < 0)
+    {
+        g_mqtt.publish("command-result",
+                       "{\"command\":" + WebUi::jsonString(subtopic) +
+                       ",\"value\":" + WebUi::jsonString(payload) +
+                       ",\"result\":\"abgelehnt: Wert muss ON oder OFF sein\"}", false);
+        return;
+    }
+    command.on = (value == 1);
+    xQueueSend(g_commandQueue, &command, 0);
+}
+
+void mqttTask(void*)
+{
+    // Client-ID: ve-direct-XXXXXX (aus der MAC, eindeutig je Gerät)
+    char clientId[32];
+    snprintf(clientId, sizeof(clientId), "%s-%06llX", DefaultHostname,
+             static_cast<unsigned long long>(ESP.getEfuseMac() & 0xFFFFFF));
+    g_mqtt.begin(clientId);
+    g_mqtt.onMessage(onMqttMessage);
+    g_mqtt.subscribe("relay/r1-set");
+    g_mqtt.subscribe("relay/r2-set");
+    g_mqtt.subscribe("relay/r3-set");
+    g_mqtt.subscribe("override-set");
+
+    uint32_t lastFullMs     = 0;
+    uint32_t lastConnects   = 0;
+    uint32_t lastSwitchSum  = 0;
+    bool     lastOverride   = false;
+    uint32_t lastFaults     = 0;
+    uint32_t lastCommandCnt = readControl().commandCount;
+
+    for (;;)
+    {
+        const uint32_t now = millis();
+        const NetStatus net = readNetStatus();
+        g_mqtt.loop(now, net.staConnected);
+
+        if (g_mqtt.connected())
+        {
+            const SystemState     state   = readSystemState();
+            const ControlSnapshot control = readControl();
+            const MqttStatus      mst     = g_mqtt.status();
+
+            uint32_t switchSum = 0;
+            for (size_t i = 0; i < RelayCount; ++i) switchSum += control.relays[i].switchCount;
+
+            const bool reconnected = mst.connectCount != lastConnects;
+            const bool due = reconnected ||
+                             static_cast<uint32_t>(now - lastFullMs) >= g_mqtt.intervalMs();
+            const bool controlChanged = switchSum != lastSwitchSum ||
+                                        control.overrideActive != lastOverride;
+            const bool faultsChanged  = state.faults != lastFaults;
+
+            if (due)
+            {
+                g_mqtt.publish("battery", buildBatteryJson(state), true);
+                g_mqtt.publish("pv",      buildPvJson(state), true);
+                lastFullMs   = now;
+                lastConnects = mst.connectCount;
+            }
+            if (due || controlChanged)
+            {
+                g_mqtt.publish("relays", buildRelaysJson(control), true);
+                lastSwitchSum = switchSum;
+                lastOverride  = control.overrideActive;
+            }
+            if (due || faultsChanged)
+            {
+                g_mqtt.publish("system", buildSystemJson(state, net), true);
+                lastFaults = state.faults;
+            }
+
+            // Rückmeldung zu MQTT-Befehlen
+            if (control.commandCount != lastCommandCnt)
+            {
+                lastCommandCnt = control.commandCount;
+                if (control.lastCommand.source == CommandSource::Mqtt)
+                {
+                    const String cmd = control.lastCommand.kind == CommandKind::Override
+                        ? String("override-set")
+                        : "relay/r" + String(static_cast<unsigned>(control.lastCommand.relay) + 1) + "-set";
+                    const char* result = control.lastCommand.kind == CommandKind::Override
+                        ? "ausgeführt" : LoadController::resultText(control.lastResult);
+                    g_mqtt.publish("command-result",
+                                   "{\"command\":\"" + cmd + "\",\"value\":\"" +
+                                   onOff(control.lastCommand.on) + "\",\"result\":" +
+                                   WebUi::jsonString(result) + "}", false);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -1234,8 +1499,8 @@ bool g_showFrames = false;
 
 void printHelp()
 {
-    Serial.println("[HILFE] Befehle: r1 ein | r1 aus | override ein | override aus | "
-                   "bloecke ein | bloecke aus | hilfe");
+    Serial.println("[HILFE] Befehle: r1|r2|r3 ein|aus | override ein|aus | "
+                   "bloecke ein|aus | hilfe");
 }
 
 /// Eine vollständige Eingabezeile auswerten.
@@ -1284,13 +1549,17 @@ void handleCommandLine(char* line)
     ControlCommand command;
     command.source = CommandSource::Local;
 
-    if (std::strcmp(line, "r1 ein") == 0 || std::strcmp(line, "r1 an") == 0 || std::strcmp(line, "r1 on") == 0)
+    // "r1 ein", "r2 aus", ... (r1..r3; ein/an/on bzw. aus/off)
+    const bool relayCmd = line[0] == 'r' && line[1] >= '1' && line[1] <= '3' && line[2] == ' ';
+    const char* arg = relayCmd ? line + 3 : "";
+    const bool argOn  = std::strcmp(arg, "ein") == 0 || std::strcmp(arg, "an") == 0 || std::strcmp(arg, "on") == 0;
+    const bool argOff = std::strcmp(arg, "aus") == 0 || std::strcmp(arg, "off") == 0;
+
+    if (relayCmd && (argOn || argOff))
     {
-        command.kind = CommandKind::Relay; command.relay = RelayId::Main; command.on = true;
-    }
-    else if (std::strcmp(line, "r1 aus") == 0 || std::strcmp(line, "r1 off") == 0)
-    {
-        command.kind = CommandKind::Relay; command.relay = RelayId::Main; command.on = false;
+        command.kind  = CommandKind::Relay;
+        command.relay = static_cast<RelayId>(line[1] - '1');
+        command.on    = argOn;
     }
     else if (std::strcmp(line, "override ein") == 0 || std::strcmp(line, "override on") == 0)
     {
@@ -1383,6 +1652,52 @@ void printNetwork(const NetStatus& n)
     Serial.println();
 }
 
+/// MQTT-Zustand bei Änderung melden (nur Logger-Task).
+MqttState g_mqttPrintedState = MqttState::Disabled;
+bool      g_mqttPrinted = false;
+
+uint32_t g_mqttPrintedRx = 0;
+
+void printMqttChanges()
+{
+    const MqttStatus st = g_mqtt.status();
+
+    // Empfangene Nachrichten (Befehle) protokollieren
+    if (st.receiveCount != g_mqttPrintedRx)
+    {
+        g_mqttPrintedRx = st.receiveCount;
+        Serial.printf("[MQTT] empfangen: %s = %s\n", st.lastRxTopic, st.lastRxPayload);
+    }
+
+    if (g_mqttPrinted && st.state == g_mqttPrintedState)
+    {
+        return;
+    }
+    g_mqttPrinted = true;
+    g_mqttPrintedState = st.state;
+
+    const MqttConfig cfg = g_mqtt.config();
+    switch (st.state)
+    {
+        case MqttState::Disabled:
+            Serial.println("[MQTT] aus (nicht eingerichtet oder ausgeschaltet)");
+            break;
+        case MqttState::NoNetwork:
+            Serial.println("[MQTT] wartet auf WLAN-Verbindung");
+            break;
+        case MqttState::Connecting:
+            Serial.printf("[MQTT] verbinde mit %s:%u ...\n", cfg.host.c_str(), static_cast<unsigned>(cfg.port));
+            break;
+        case MqttState::Connected:
+            Serial.printf("[MQTT] verbunden mit %s:%u, Basis-Topic \"%s\"\n",
+                          cfg.host.c_str(), static_cast<unsigned>(cfg.port), cfg.baseTopic.c_str());
+            break;
+        case MqttState::Error:
+            Serial.printf("[MQTT] Fehler: %s (neuer Versuch folgt)\n", st.lastError);
+            break;
+    }
+}
+
 void printNetworkChanges()
 {
     const NetStatus n = readNetStatus();
@@ -1441,6 +1756,7 @@ void loggerTask(void*)
         const ControlSnapshot control = readControl();
         printControlChanges(control);
         printNetworkChanges();
+        printMqttChanges();
 
         if (millis() - lastStatusMs >= StatusIntervalMs)
         {
@@ -1475,7 +1791,7 @@ void setup()
 
     Serial.println();
     Serial.println("--------------------------------------------------");
-    Serial.println("Victron VE.Direct Reader - Stufe W2 (WLAN, WebUI, Updates)");
+    Serial.println("Victron VE.Direct Reader - Stufe W3 (WLAN, WebUI, Updates, MQTT)");
     Serial.printf("Firmware: %s\n", FirmwareVersion);
 
     // W2: Probestart nach Update prüfen. Lief die neue Firmware zu oft nicht
@@ -1501,7 +1817,7 @@ void setup()
     }
     Serial.printf("Anlage: %s\n", g_config.installation.load() == Installation::Balcony
                                       ? "Balkonkraftwerk" : "Camper");
-    Serial.println("Befehle im Monitor: r1 ein | r1 aus | override ein | override aus | "
+    Serial.println("Befehle im Monitor: r1|r2|r3 ein|aus | override ein|aus | "
                    "bloecke ein | bloecke aus | hilfe");
     Serial.println("Blockausgabe ist AUS (einschalten mit: bloecke ein)");
     Serial.println("UART1: RX 16 / TX 17    UART2: RX 26 / TX 33");
@@ -1559,6 +1875,10 @@ void setup()
     // WLAN + WebUI (Stufe W1)
     xTaskCreatePinnedToCore(webTask, "Web", WebTaskStack,
                             nullptr, WebTaskPriority, nullptr, 0);
+
+    // MQTT (Stufe W3)
+    xTaskCreatePinnedToCore(mqttTask, "Mqtt", MqttTaskStack,
+                            nullptr, MqttTaskPriority, nullptr, 0);
 
     // Je ein Kern pro UART-Kanal (wie bisher).
     xTaskCreatePinnedToCore(uartTask, "UART1", UartTaskStack,

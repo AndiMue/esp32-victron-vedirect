@@ -31,6 +31,14 @@
  *   POST /api/update/package    package_*.tar             -> Neustart
  *   Ergebnis und Versionen auch in /api/status ("update", "firmware", "webui").
  *
+ * API (W3, MQTT – nur wenn setMqtt() aufgerufen wurde):
+ *   GET  /api/mqtt          Konfiguration (ohne Passwort) + Zustand
+ *   POST /api/mqtt          enabled, host, port, user, password (leer =
+ *                           behalten), baseTopic, intervalS, clientId
+ *   POST /api/mqtt/test     sofort neu verbinden
+ *   POST /api/mqtt/reset    MQTT-Einstellungen löschen
+ *   Zustand auch in /api/status ("mqtt").
+ *
  * Nur aus EINER Task verwenden (Web-Task): begin(), dann loop().
  ******************************************************************************/
 
@@ -43,6 +51,7 @@
 #include "UpdateManager.hpp"
 
 class WifiManager;
+class MqttManager;
 
 class WebUi
 {
@@ -59,6 +68,9 @@ public:
     void loop(uint32_t nowMs);
 
     void setStatusExtension(StatusExtension extension) { m_extension = extension; }
+
+    /// MQTT-Verwaltung einbinden (optional, vor begin() aufrufen).
+    void setMqtt(MqttManager* mqtt) { m_mqtt = mqtt; }
 
     /// Läuft gerade ein Update? (aus anderen Tasks lesbar, z. B. Display)
     bool updateRunning() const { return m_updateRunning.load(); }
@@ -83,6 +95,14 @@ private:
     void handleUpload(UpdateManager::Kind kind);
     void finishUpload();
     String webUiVersion() const;
+
+    void handleMqttGet();
+    void handleMqttPost();
+    void handleMqttTest();
+    void handleMqttReset();
+    String mqttStatusJson() const;
+
+    MqttManager*      m_mqtt = nullptr;
 
     UpdateManager     m_update;
     bool              m_uploadAuthorized = false;

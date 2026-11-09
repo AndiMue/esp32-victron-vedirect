@@ -52,6 +52,7 @@ document.querySelectorAll(".tab").forEach((btn) => {
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.remove("hidden");
     if (btn.dataset.tab === "wifi") loadWifi();
+    if (btn.dataset.tab === "mqtt") loadMqtt();
   });
 });
 
@@ -93,6 +94,7 @@ async function refreshStatus() {
       ? "Neue Firmware läuft auf Probe (wird nach 60 s bestätigt)"
       : "Firmware bestätigt";
     $("rollbackWarning").classList.toggle("hidden", !s.update.rolledBack);
+    if (s.mqtt) showMqttStatus(s.mqtt);
     $("stUptime").textContent = formatUptime(s.uptimeS);
     $("stHeap").textContent = Math.round(s.freeHeap / 1024) + " KB";
     $("pwWarning").classList.toggle("hidden", !s.defaultPassword);
@@ -194,6 +196,89 @@ $("wifiResetBtn").addEventListener("click", async () => {
     await api("/api/wifi/reset", {});
     toast("WLAN-Zugangsdaten gelöscht.");
     loadWifi();
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// MQTT (W3)
+// ---------------------------------------------------------------------------
+const mqttStateText = {
+  disabled:   "aus",
+  no_network: "wartet auf WLAN-Verbindung",
+  connecting: "verbinde …",
+  connected:  "verbunden",
+  error:      "Fehler – neuer Versuch folgt",
+};
+
+function showMqttStatus(m) {
+  const text = (mqttStateText[m.state] || m.state) + (m.broker && m.state !== "disabled" ? " (" + m.broker + ")" : "");
+  $("stMqtt").textContent = text;
+  $("mqState").textContent = text;
+  $("mqError").textContent = m.error || "–";
+  $("mqCounts").textContent = m.publishCount + " Nachrichten, " + m.receiveCount + " Befehle empfangen" +
+    (m.publishCount ? ", zuletzt vor " + m.lastPublishAgoS + " s" : "");
+  $("tpBase1").textContent = m.baseTopic || "vedirect";
+}
+
+async function loadMqtt() {
+  try {
+    const m = await api("/api/mqtt");
+    $("mqEnabled").checked = m.enabled;
+    $("mqHost").value = m.host;
+    $("mqPort").value = m.port;
+    $("mqUser").value = m.user;
+    $("mqPass").value = "";
+    $("mqPassHint").textContent = m.passwordSet
+      ? "Ein Passwort ist gespeichert. Leer lassen = behalten."
+      : "Kein Passwort gespeichert.";
+    $("mqBase").value = m.baseTopic;
+    $("mqInterval").value = m.intervalS;
+    $("mqClient").value = m.clientId;
+    showMqttStatus(m.status);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("mqttForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    await api("/api/mqtt", {
+      enabled: $("mqEnabled").checked ? "1" : "0",
+      host: $("mqHost").value,
+      port: $("mqPort").value,
+      user: $("mqUser").value,
+      password: $("mqPass").value,
+      baseTopic: $("mqBase").value,
+      intervalS: $("mqInterval").value,
+      clientId: $("mqClient").value,
+    });
+    $("mqPass").value = "";
+    toast("Gespeichert. Verbinde mit dem Broker …");
+    setTimeout(loadMqtt, 4000);
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+$("mqTestBtn").addEventListener("click", async () => {
+  try {
+    await api("/api/mqtt/test", {});
+    toast("Verbindung wird neu aufgebaut …");
+    setTimeout(loadMqtt, 4000);
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+$("mqResetBtn").addEventListener("click", async () => {
+  if (!confirm("MQTT-Einstellungen wirklich löschen?")) return;
+  try {
+    await api("/api/mqtt/reset", {});
+    toast("MQTT-Einstellungen gelöscht.");
+    loadMqtt();
   } catch (e) {
     toast(e.message, true);
   }

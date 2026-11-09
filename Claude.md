@@ -33,6 +33,21 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 - Testergebnisse und technische Entscheidungen dokumentieren.
 - Keine Änderungen an der Hardwarekonfiguration ohne Rücksprache.
 
+### Zusammenarbeit (festgehalten 09.11.2026)
+- **Commits macht ausschließlich der Projektinhaber.** Claude committet nie, auch nicht `Claude.md`.
+- Kommunikation und Code-Kommentare auf **Deutsch**. Ausgaben auf Serial/Display: Display ohne Umlaute (ae/oe/ue), Monitor/WebUI mit Umlauten.
+- Vorgehen je Stufe: Vorschlag mit offenen Fragen → Freigabe → Umsetzung → Tests (PC + ESP32) → Hardwaretest durch den Projektinhaber → Findings beheben → Eintrag in `Claude.md` → Commit durch den Projektinhaber.
+- Findings des Projektinhabers werden mit Ursache und Abhilfe in `Claude.md` notiert.
+
+### Bauen, Testen, Flashen (Stand 09.11.2026)
+- **PlatformIO immer aus VS Code nutzen:** `%USERPROFILE%\.platformio\penv\Scripts\pio.exe` (6.2.0). `pio` im PATH (6.1.18, Python 3.13) baut GxEPD2 nicht.
+- PC-Tests: `pio test -e native` (in PowerShell; in der Bash von Claude Code nur mit `C:\msys64\ucrt64\bin` vorne im PATH). ESP32-Tests: `pio test -e esp32dev` (überschreibt die Firmware! danach `pio run -t upload`).
+- ESP32 hängt an **COM17** (CH9102). Vor dem Flashen prüfen, ob der Port frei ist (serieller Monitor des Projektinhabers belegt ihn sonst: „Zugriff verweigert“/„port doesn't exist“).
+- Nach Änderung an `platformio.ini` liest VS Code das Projekt neu ein; ein gleichzeitiger Build kann mit „WinError 2 … .cpp.d“ scheitern → einfach erneut bauen.
+- Nach Änderung der **Partitionierung**: Firmware per USB + `pio run -t uploadfs` (WebUI-Dateien neu). NVS (WLAN, Passwort) bleibt erhalten.
+- **Updates im Normalfall per Browser** (WebUI → Update), Dateien aus `.pio/build/esp32dev/` (`package_*.tar`, `firmware_*.bin`, `webui_*.tar`). USB nur noch für Debug-Ausgaben und als Rettungsweg.
+- Serieller Monitor: `pio device monitor -p COM17` (mit `monitor_echo`). Befehle: `r1 ein|aus`, `override ein|aus`, `bloecke ein|aus`, `hilfe`, Testfunktion `absturz` (später entfernen).
+
 ## Aktueller Stand und nächste Schritte (Stand: 05.11.2026)
 
 ### Bestätigte Fakten (vom Projektinhaber)
@@ -245,7 +260,25 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
   - Rückfall-Test Projektinhaber 08.11.2026 erfolgreich (3 × `absturz` → Rückfall auf die vorherige Firmware). Finding danach: Nach dem erneuten Paket-Update war das WLAN eine Weile nicht erreichbar (nur AP), WLAN-Suche ging nicht, Zugangsdaten schienen zu fehlen. Ursache: Fritz!Box lehnt den ersten Anmeldeversuch nach einem Neustart ab (Code 202) → 20 s Geduld zu kurz → AP-Rückfall mit Wiederholung erst nach 60 s; automatisches Wiederverbinden störte die Suche; Browser hielt die alte `app.js` im Cache. Behoben: 30 s Geduld, erster Wiederholversuch nach 15 s, Wiederverbinden während der Suche pausiert, WebUI-Dateien mit `Cache-Control: no-cache`.
   - **TESTFUNKTION `absturz`** im seriellen Monitor (löst `abort()` aus) zum Testen des Rückfalls → **später wieder entfernen** (in `main.cpp`, `handleCommandLine`).
   - **Kein ArduinoOTA** (Entscheidung Projektinhaber 08.11.2026). USB bleibt in der Entwicklung für Debug-Ausgaben und als Rettungsweg. Spätere Unterscheidung Develop/Serie möglich.
-- **W3:** MQTT (Konfiguration, Werte veröffentlichen, R1-Befehl fürs BKW, Verhalten bei Verbindungsabbruch: Zustand halten).
+- **W2 abgeschlossen** (Projektinhaber 08.11.2026: WebUI-Update, Paket-Update, Paket-Sperre unter „Nur WebUI“, Rückfall getestet; Trennstriche im Update-Reiter, Hinweis „Passwort gespeichert“ fett). Committet vom Projektinhaber.
+- **W3: MQTT – abgeschlossen 09.11.2026.** Test Projektinhaber mit MQTT.fx: Befehle (`vedirect/relay/r2-set` = `ON`) schalten, Empfangszähler zählt hoch, Topics und Letzter Wille ok. Hinweis zur Bedienung MQTT.fx: Profil (Zahnrad) mit Broker 192.168.178.41:1883 anlegen → Connect → Reiter Publish: Topic oben, Payload im großen Feld, Knopf Publish rechts neben dem Topic. Entscheidungen Projektinhaber 09.11.2026:
+  - Benutzer/Passwort möglich (derzeit leer), kein TLS. Basis-Topic `vedirect` (einstellbar). **Getrennte JSON je Bereich.** Intervall 10 s Standard, **alle MQTT-Parameter in der WebUI einstellbar**.
+  - **Alle Relais und Override per MQTT schaltbar**; Befehls-Topics `…/relay/r1-set`, `r2-set`, `r3-set`, `…/override-set` (ON/OFF, auch 1/0/true/false). Rücklesen der Relais (Hilfskontakt) evtl. späteres Upgrade.
+  - Schalten soll auch im Camper ohne Router gehen (über AP/WebUI, W4); MQTT nur, wenn das Heim-WLAN erreichbar ist.
+  - Umsetzung: `lib/WebCore/MqttManager` (PubSubClient, eigene `mqttTask`, Letzter Wille `…/status` online/offline, Wiederholung 5–60 s, Konfiguration im NVS-Namensraum `mqtt`, Passwort nie an die WebUI). Topics `…/battery`, `…/pv`, `…/relays`, `…/system` (retained, ungültige Werte = `null`), `…/command-result` (Rückmeldung, nicht retained). Sofort senden bei Relais-/Override-/Fehleränderung. WebUI-Reiter „MQTT“, `/api/mqtt` (GET/POST), `/api/mqtt/test`, `/api/mqtt/reset`. E-Paper-Symbol MQTT. Monitor `[MQTT]`-Meldungen, neue Befehle `r2|r3 ein|aus`.
+  - **LoadController umgebaut (Modell „Schaltwunsch“):** jedes Relais hat einen Wunsch; R2/R3 nach Start „ein“, per Befehl schaltbar, SOC-Schutz stellt den Wunsch wieder her; Camper-R1 nach Start „aus“, nach Schutzabschaltung kein Wiedereinschalten. Alle Befehlsquellen erlaubt (Einschränkung per Konfiguration möglich). Override schaltet nur gewünschte Relais. 92/92 PC-Tests.
+  - Test Projektinhaber 09.11.2026 mit `26.11.09-1651`: Verbindung, Topics, Letzter Wille (offline nach Ausschalten) ok. Finding „`r2-set off` schaltet nicht“: Nachricht kam am ESP32 nicht an (Empfangszähler blieb 0). Gegenprobe von Claude mit eigenem Testclient gegen 192.168.178.41: `vedirect/relay/r2-set` = `OFF` → R2 aus, `command-result` „ausgeführt“ → Firmware korrekt, Ursache auf Senderseite (Topic/Payload/Broker im Testprogramm).
+  - Build `26.11.09-1716`: Monitor-Zeile `[MQTT] empfangen: <Topic> = <Wert>`; ganze Zahlen im JSON ohne führendes Leerzeichen (`String(float,0)` lieferte `" 0"`); Fortschrittsbalken im Update-Reiter abgetrennt mit Überschrift „Fortschritt“.
+  - Nach dem Build `26.11.09-1651` geändert (in `26.11.09-1716` enthalten): E-Paper zeigt das MQTT-Symbol, sobald MQTT eingerichtet ist, **auch ohne WLAN – dann durchgestrichen** (Entscheidung Projektinhaber 09.11.2026).
+  - Hinweis: Ein **retained** Befehl aus Node-RED (z. B. `r1-set ON`) wird nach jedem Neustart erneut ausgeführt → in Node-RED Retain bei Befehlen nur bewusst setzen.
+  Ursprünglicher Vorschlag (zur Nachvollziehbarkeit):
+  - WebUI-Reiter „MQTT“: Host, Port, Benutzer, Passwort (nur „gesetzt“), Basis-Topic, Intervall, ein/aus, „Verbindung testen“; NVS, rücksetzbar.
+  - Bibliothek PubSubClient (ESP32 + ESP8266).
+  - Last Will: `…/status` = `online`/`offline`.
+  - Einzelne Topics je Wert, z. B. `vedirect/battery/soc`, `…/voltage`, `…/current`, `…/power`, `vedirect/pv/power`, `vedirect/pv/state`, `vedirect/relay/r1..r3` (ON/OFF), `vedirect/override`, `vedirect/faults`.
+  - Befehle: `vedirect/relay/r1/set` ON/OFF (BKW; SOC-Schutz gilt immer; bei MQTT-Abbruch Zustand halten).
+  - E-Paper: MQTT-Symbol, sobald eingerichtet.
+  - **Offene Fragen:** (1) Broker: wo, Benutzer/Passwort, TLS nötig? (2) Topic-Schema `vedirect/…` oder `vedirect/<Gerätename>/…`, vorhandenes Schema in Node-RED? (3) Einzelne Topics oder JSON je Bereich? (4) Befehle nur R1 oder auch R2/R3/Override? (5) Intervall 10 s + sofort bei Änderung?
 - **W4:** Projektseiten (Live-Werte, Relais, Override, Schwellen, **Statusmeldungen**), Sicherung/Wiederherstellung.
 - **E-Paper mit Symbolen (umgesetzt 08.11.2026):** Symbolleiste: WLAN-Balken (4 Stufen nach RSSI, durchgestrichen ohne WLAN), AP (schwarz = an, durchgestrichen = aus), MQTT (nur bei WLAN + eingerichtetem MQTT, ab W3), OVR (nur bei Override), Warndreieck (gefüllt = kritisch, leer = Warnung). Lade-/Entladepfeil am SOC (▲ lädt, ▼ entlädt, o Ruhe bei |I| < 0,05 A). Untere Zeile: Shunt/MPPT ● ok, ◐ instabil, ⊗ defekt. Textliche Statuszeile entfällt (Details → WebUI). Sofort aktualisiert: Symbole/Zustände/Relais; WLAN-Balken und Pfeil im 30-s-Takt mit den Werten.
 - MPPT-Simulator: GND war laut Projektinhaber immer verbunden; Ursache der Prüfsummenfehler nach der Umstellung auf USB-Versorgung noch offen → weiter beobachten.

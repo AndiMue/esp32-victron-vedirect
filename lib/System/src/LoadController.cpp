@@ -18,7 +18,6 @@ const char* const ReasonCommandOff   = "Befehl aus";
 const char* const ReasonSocLow       = "SOC unter Abschaltschwelle";
 const char* const ReasonNoSoc        = "kein gültiger SOC";
 const char* const ReasonSocRecovered = "SOC wieder ausreichend";
-const char* const ReasonRestored     = "gespeicherter Wunsch ausgeführt";
 const char* const ReasonOverride     = "Override";
 const char* const ReasonOverrideEnd  = "Override beendet";
 const char* const ReasonDisabled     = "deaktiviert";
@@ -40,9 +39,8 @@ LoadControllerConfig LoadControllerConfig::camper()
     RelayConfig& main = c.relays[static_cast<std::size_t>(RelayId::Main)];
     main.name               = "Wechselrichter";
     main.shortName          = "WR";
-    main.manual             = true;
-    main.allowedSources     = sourceBit(CommandSource::Local) | sourceBit(CommandSource::WebUi);
-    main.rememberRequest    = false;   // nach Schutzabschaltung neu per Taster einschalten
+    main.startupRequest     = false;   // nach Neustart aus (Projektinhaber)
+    main.rememberRequest    = false;   // nach Schutzabschaltung neu einschalten
     main.requiresSoc        = true;    // ohne Shunt kein Wechselrichter
     main.forceOffWithoutSoc = true;
     main.lockBelowSoc       = 25.0f;
@@ -50,22 +48,24 @@ LoadControllerConfig LoadControllerConfig::camper()
     main.releaseAtSoc       = 30.0f;
 
     RelayConfig& light = c.relays[static_cast<std::size_t>(RelayId::Light)];
-    light.name         = "Licht";
-    light.shortName    = "Licht";
-    light.onAtStartup  = true;
-    light.lockBelowSoc = 15.0f;
-    light.offBelowSoc  = 15.0f;
-    light.releaseAtSoc = 20.0f;
-    light.minOffTimeMs = 60000;
+    light.name            = "Licht";
+    light.shortName       = "Licht";
+    light.startupRequest  = true;
+    light.rememberRequest = true;
+    light.lockBelowSoc    = 15.0f;
+    light.offBelowSoc     = 15.0f;
+    light.releaseAtSoc    = 20.0f;
+    light.minOffTimeMs    = 60000;
 
     RelayConfig& fridge = c.relays[static_cast<std::size_t>(RelayId::Fridge)];
-    fridge.name         = "Kühlschrank";
-    fridge.shortName    = "Kuehl";
-    fridge.onAtStartup  = true;
-    fridge.lockBelowSoc = 5.0f;
-    fridge.offBelowSoc  = 5.0f;
-    fridge.releaseAtSoc = 10.0f;
-    fridge.minOffTimeMs = 60000;
+    fridge.name            = "Kühlschrank";
+    fridge.shortName       = "Kuehl";
+    fridge.startupRequest  = true;
+    fridge.rememberRequest = true;
+    fridge.lockBelowSoc    = 5.0f;
+    fridge.offBelowSoc     = 5.0f;
+    fridge.releaseAtSoc    = 10.0f;
+    fridge.minOffTimeMs    = 60000;
 
     return c;
 }
@@ -77,7 +77,6 @@ LoadControllerConfig LoadControllerConfig::balcony()
     RelayConfig& main = c.relays[static_cast<std::size_t>(RelayId::Main)];
     main.name            = "DC-DC-Wandler";
     main.shortName       = "DC-DC";
-    main.allowedSources  = sourceBit(CommandSource::Mqtt) | sourceBit(CommandSource::WebUi);
     main.rememberRequest = true;   // Hausautomatisierung: Wunsch bleibt bestehen
 
     c.relays[static_cast<std::size_t>(RelayId::Light)].enabled  = false;
@@ -105,7 +104,10 @@ void LoadController::start(uint32_t nowMs)
         RelayStatus& st = m_status[i];
 
         st = RelayStatus();
-        st.on        = cfg.enabled && !cfg.manual && cfg.onAtStartup;
+        st.requested = cfg.enabled && cfg.startupRequest;
+        // Sofort ein nur, wenn kein gültiger SOC nötig ist (R2/R3);
+        // R1 wartet auf update() mit gültigem SOC.
+        st.on        = st.requested && !cfg.requiresSoc;
         st.reason    = cfg.enabled ? ReasonStartup : ReasonDisabled;
         st.changedMs = nowMs;
         st.lastOffMs = nowMs;
@@ -172,49 +174,42 @@ void LoadController::updateRelay(std::size_t index, const SystemState& state, ui
         return;
     }
 
-    // ---- Override: alle Sperren umgehen ----
+    // ---- Override: alle Sperren umgehen, nur der Wunsch zählt ----
     if (m_override)
     {
-        const bool desired = cfg.manual ? st.requested : true;
-        setRelay(index, desired, ReasonOverride, nowMs);
+        setRelay(index, st.requested, ReasonOverride, nowMs);
         return;
     }
 
     updateLock(index, state);
 
     // ---- Zwangsabschaltung ----
-    const bool valid = socValid(state);
+    const bool valid     = socValid(state);
     const bool socTooLow = valid && state.stateOfCharge.value < cfg.offBelowSoc;
     const bool noSocOff  = !valid && cfg.requiresSoc && cfg.forceOffWithoutSoc;
 
     if (socTooLow || noSocOff)
     {
         setRelay(index, false, socTooLow ? ReasonSocLow : ReasonNoSoc, nowMs);
-        if (cfg.manual && !cfg.rememberRequest)
+        if (!cfg.rememberRequest)
         {
-            st.requested = false;   // Camper: neu per Taster einschalten
+            st.requested = false;   // Camper-WR: neu per Befehl einschalten
         }
         return;
     }
 
-    if (st.locked || st.on)
+    // ---- Wunsch "aus" ----
+    if (!st.requested)
     {
-        return;   // gesperrt oder bereits ein: nichts zu tun
-    }
-
-    // ---- Einschalten ----
-    if (cfg.manual)
-    {
-        if (cfg.rememberRequest && st.requested)
-        {
-            setRelay(index, true, ReasonRestored, nowMs);
-        }
+        setRelay(index, false, ReasonCommandOff, nowMs);
         return;
     }
 
-    // Automatisches Relais: nicht gesperrt und lange genug aus -> ein.
-    // (Ohne gültigen SOC bleibt eine bestehende Sperre erhalten, siehe
-    // updateLock(); ein nie gesperrtes Relais darf dann weiterlaufen.)
+    // ---- Wunsch "ein": einschalten, wenn frei und lange genug aus ----
+    if (st.on || st.locked)
+    {
+        return;
+    }
     if (DeviceState::ageMs(st.lastOffMs, nowMs) >= cfg.minOffTimeMs)
     {
         setRelay(index, true, ReasonSocRecovered, nowMs);
@@ -239,8 +234,7 @@ CommandResult LoadController::request(RelayId relay, bool on, CommandSource sour
     const RelayConfig& cfg = m_config.relays[index];
     RelayStatus& st = m_status[index];
 
-    if (!cfg.enabled)                                return CommandResult::RejectedDisabled;
-    if (!cfg.manual)                                 return CommandResult::RejectedNotManual;
+    if (!cfg.enabled)                                  return CommandResult::RejectedDisabled;
     if ((cfg.allowedSources & sourceBit(source)) == 0) return CommandResult::RejectedSource;
 
     if (!on)
@@ -263,7 +257,7 @@ CommandResult LoadController::request(RelayId relay, bool on, CommandSource sour
     {
         if (cfg.rememberRequest)
         {
-            st.requested = true;   // BKW: später automatisch
+            st.requested = true;   // später automatisch, wenn der SOC reicht
             return CommandResult::Deferred;
         }
         return CommandResult::RejectedLocked;
@@ -305,12 +299,11 @@ const char* LoadController::resultText(CommandResult result)
 {
     switch (result)
     {
-        case CommandResult::Accepted:          return "ausgeführt";
-        case CommandResult::Deferred:          return "gespeichert, wird bei ausreichendem SOC ausgeführt";
-        case CommandResult::RejectedLocked:    return "abgelehnt: SOC zu niedrig oder kein gültiger SOC";
-        case CommandResult::RejectedSource:    return "abgelehnt: Befehlsquelle nicht erlaubt";
-        case CommandResult::RejectedNotManual: return "abgelehnt: Relais schaltet automatisch";
-        case CommandResult::RejectedDisabled:  return "abgelehnt: Relais deaktiviert";
+        case CommandResult::Accepted:         return "ausgeführt";
+        case CommandResult::Deferred:         return "gespeichert, wird bei ausreichendem SOC ausgeführt";
+        case CommandResult::RejectedLocked:   return "abgelehnt: SOC zu niedrig oder kein gültiger SOC";
+        case CommandResult::RejectedSource:   return "abgelehnt: Befehlsquelle nicht erlaubt";
+        case CommandResult::RejectedDisabled: return "abgelehnt: Relais deaktiviert";
     }
     return "?";
 }

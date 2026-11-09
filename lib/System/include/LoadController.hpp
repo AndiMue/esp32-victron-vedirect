@@ -1,42 +1,44 @@
 /******************************************************************************
  * @file LoadController.hpp
  *
- * Abschaltlogik (Stufe 4b): entscheidet anhand des Systemzustands, welche
- * Relais ein- oder ausgeschaltet sein SOLLEN. Schaltet selbst keine GPIOs
- * (das kommt in Stufe 4c).
+ * Abschaltlogik: entscheidet anhand des Systemzustands, welche Relais ein-
+ * oder ausgeschaltet sein SOLLEN. Schaltet selbst keine GPIOs (RelayDriver).
  *
  * Relais (Entscheidung Projektinhaber 06.11.2026):
  *   R1 Hauptverbraucher  Camper: Wechselrichter, Balkonkraftwerk: DC-DC
  *   R2 Licht             (nur Camper)
  *   R3 Kühlschrank       (nur Camper)
  *
+ * Modell "Schaltwunsch" (seit W3, 09.11.2026 – alle Relais schaltbar):
+ *   Jedes Relais hat einen Wunsch (requested) ein/aus. Der Wunsch kommt von
+ *   Befehlen (Taster/Touch, WebUI, MQTT) bzw. nach dem Start aus
+ *   startupRequest. Das Relais ist EIN, wenn
+ *       Wunsch = ein  UND  nicht gesperrt (SOC-Schutz)
+ *   (Override: Wunsch allein entscheidet, alle Sperren aufgehoben.)
+ *
  * Schwellen je Relais (alle konfigurierbar, SOC in %):
  *   lockBelowSoc   unter diesem SOC darf das Relais NICHT eingeschaltet werden
  *   offBelowSoc    unter diesem SOC wird es zwangsweise ausgeschaltet
  *   releaseAtSoc   ab diesem SOC ist die Sperre wieder aufgehoben (Hysterese)
+ *   Beispiel R1: gesperrt < 25 %, aus < 15 %, frei ab 30 % -> ein laufender
+ *   Wechselrichter läuft bei 20 % weiter, kann aber nach dem Ausschalten
+ *   erst ab 30 % wieder eingeschaltet werden.
  *
- *   Beispiel R1: gesperrt < 25 %, aus < 15 %, frei ab 30 %.
- *   -> Ein laufender Wechselrichter läuft bei 20 % weiter, kann aber nach
- *      dem Ausschalten erst ab 30 % wieder eingeschaltet werden.
- *
- * Betriebsarten:
- *   manual = true   schaltet nur auf Befehl ein (R1). Erlaubte Befehlsquellen
- *                   je Anlage (Camper: Taster/Touch + WebUI, BKW: MQTT + WebUI).
- *                   rememberRequest = true (BKW): Ein gespeicherter Wunsch "ein"
- *                   wird nach einer Schutzabschaltung bei ausreichendem SOC
- *                   automatisch wieder ausgeführt.
- *   manual = false  schaltet automatisch (R2, R3), frühestens minOffTimeMs nach
- *                   dem Ausschalten wieder ein (Schutz z. B. für Kompressor).
+ * Nach einer Schutzabschaltung:
+ *   rememberRequest = true   Wunsch bleibt; bei ausreichendem SOC und nach
+ *                            minOffTimeMs wieder EIN (R2/R3, BKW-R1)
+ *   rememberRequest = false  Wunsch wird gelöscht; neu einschalten nur per
+ *                            Befehl (Camper-R1: Wechselrichter)
  *
  * Ohne gültigen SOC (Shunt fehlt, nicht synchronisiert):
  *   requiresSoc = true   (R1)   gesperrt; forceOffWithoutSoc = true -> aus
  *   requiresSoc = false  (R2/3) Zustand bleibt (Kleinverbraucher laufen weiter)
  *
- * Override: umgeht ALLE Sperren. Manuelle Relais folgen nur dem Befehl,
- * automatische sind ein. Wird nicht gespeichert -> nach Neustart Normalbetrieb.
+ * Override: umgeht ALLE Sperren, Relais folgen nur dem Wunsch. Wird nicht
+ * gespeichert -> nach Neustart Normalbetrieb.
  *
- * Nach dem Start (start()): manuelle Relais aus, automatische Relais
- * gemäß onAtStartup (Camper: R2/R3 ein).
+ * Nach dem Start (start()): Wunsch = startupRequest (Camper: R1 aus,
+ * R2/R3 ein). Relais mit requiresSoc gehen erst ein, wenn der SOC passt.
  *
  * Reines C++ ohne Arduino -> auf dem PC testbar.
  ******************************************************************************/
@@ -71,41 +73,42 @@ constexpr uint8_t sourceBit(CommandSource source)
     return static_cast<uint8_t>(1u << static_cast<uint8_t>(source));
 }
 
+/// Alle Befehlsquellen (Entscheidung Projektinhaber 09.11.2026).
+constexpr uint8_t AllSources = 0x07;
+
 struct RelayConfig
 {
     const char* name               = "";
     const char* shortName          = "";     ///< kurz und nur ASCII (E-Paper)
     bool        enabled            = true;
-    bool        manual             = false;
-    uint8_t     allowedSources     = 0;      ///< nur manuell: Bitmaske sourceBit()
-    bool        rememberRequest    = false;  ///< nur manuell: Wunsch nach Schutzabschaltung behalten
-    bool        onAtStartup        = false;  ///< nur automatisch
+    uint8_t     allowedSources     = AllSources;
+    bool        startupRequest     = false;  ///< Wunsch nach dem Start
+    bool        rememberRequest    = false;  ///< Wunsch nach Schutzabschaltung behalten
     bool        requiresSoc        = false;  ///< ohne gültigen SOC gesperrt
     bool        forceOffWithoutSoc = false;  ///< ohne gültigen SOC zusätzlich aus
     float       lockBelowSoc       = 0.0f;
     float       offBelowSoc        = 0.0f;
     float       releaseAtSoc       = 0.0f;
-    uint32_t    minOffTimeMs       = 0;      ///< nur automatisch
+    uint32_t    minOffTimeMs       = 0;      ///< automatisches Wiedereinschalten frühestens nach
 };
 
 struct LoadControllerConfig
 {
     RelayConfig relays[RelayCount];
 
-    /// Voreinstellung Camper (Wechselrichter per Taster, Licht, Kühlschrank)
+    /// Voreinstellung Camper (Wechselrichter, Licht, Kühlschrank)
     static LoadControllerConfig camper();
 
-    /// Voreinstellung Balkonkraftwerk (DC-DC per MQTT, R2/R3 deaktiviert)
+    /// Voreinstellung Balkonkraftwerk (DC-DC, R2/R3 deaktiviert)
     static LoadControllerConfig balcony();
 };
 
 enum class CommandResult : uint8_t
 {
     Accepted,           ///< ausgeführt
-    Deferred,           ///< gespeichert, wird bei ausreichendem SOC ausgeführt
+    Deferred,           ///< Wunsch gespeichert, wird bei ausreichendem SOC ausgeführt
     RejectedLocked,     ///< SOC zu niedrig oder kein gültiger SOC
     RejectedSource,     ///< Befehlsquelle für dieses Relais nicht erlaubt
-    RejectedNotManual,  ///< Relais schaltet automatisch
     RejectedDisabled    ///< Relais ist deaktiviert
 };
 
@@ -114,7 +117,7 @@ struct RelayStatus
 {
     bool        on          = false;  ///< soll eingeschaltet sein
     bool        locked      = false;  ///< Einschalten gesperrt
-    bool        requested   = false;  ///< nur manuell: Wunsch "ein" liegt vor
+    bool        requested   = false;  ///< Schaltwunsch "ein"
     const char* reason      = "";     ///< Grund der letzten Änderung
     uint32_t    changedMs   = 0;      ///< Zeitpunkt der letzten Änderung
     uint32_t    switchCount = 0;      ///< Anzahl Schaltvorgänge seit Start

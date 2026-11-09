@@ -95,9 +95,17 @@ void test_inverter_switch_on_and_off_by_command()
     TEST_ASSERT_FALSE(isOn(RelayId::Main));
 }
 
-/// Camper: MQTT darf den Wechselrichter nicht schalten.
-void test_inverter_source_not_allowed()
+/// Seit W3: alle Quellen erlaubt (auch MQTT im Camper). Einschränkung per
+/// Konfiguration bleibt möglich.
+void test_command_sources()
 {
+    TEST_ASSERT_TRUE(g_ctl.request(RelayId::Main, true, Mqtt, withSoc(80.0f), 1000) == CommandResult::Accepted);
+    TEST_ASSERT_TRUE(isOn(RelayId::Main));
+
+    LoadControllerConfig cfg = LoadControllerConfig::camper();
+    cfg.relays[0].allowedSources = sourceBit(CommandSource::Local);
+    g_ctl.setConfig(cfg);
+    g_ctl.start(0);
     TEST_ASSERT_TRUE(g_ctl.request(RelayId::Main, true, Mqtt, withSoc(80.0f), 1000) == CommandResult::RejectedSource);
     TEST_ASSERT_FALSE(isOn(RelayId::Main));
 }
@@ -210,10 +218,38 @@ void test_light_stays_off_when_shunt_lost_afterwards()
     TEST_ASSERT_FALSE(isOn(RelayId::Light));
 }
 
-/// Automatische Relais sind nicht per Befehl schaltbar.
-void test_automatic_relay_rejects_commands()
+/// Seit W3: Licht/Kühlschrank per Befehl schaltbar. Ein bewusst
+/// ausgeschaltetes Licht bleibt aus, auch bei gutem SOC.
+void test_light_switchable_by_command()
 {
-    TEST_ASSERT_TRUE(g_ctl.request(RelayId::Light, false, Local, withSoc(50.0f), 1000) == CommandResult::RejectedNotManual);
+    TEST_ASSERT_TRUE(g_ctl.request(RelayId::Light, false, Mqtt, withSoc(50.0f), 1000) == CommandResult::Accepted);
+    TEST_ASSERT_FALSE(isOn(RelayId::Light));
+    g_ctl.update(withSoc(90.0f), 200000);
+    TEST_ASSERT_FALSE(isOn(RelayId::Light));   // bleibt aus
+
+    TEST_ASSERT_TRUE(g_ctl.request(RelayId::Light, true, Local, withSoc(90.0f), 201000) == CommandResult::Accepted);
+    TEST_ASSERT_TRUE(isOn(RelayId::Light));
+}
+
+/// Licht unter der Sperrschwelle einschalten: Wunsch wird gespeichert und
+/// bei ausreichendem SOC ausgeführt.
+void test_light_command_deferred_when_locked()
+{
+    g_ctl.update(withSoc(10.0f), 1000);          // aus, gesperrt
+    TEST_ASSERT_TRUE(g_ctl.request(RelayId::Light, true, Local, withSoc(10.0f), 2000) == CommandResult::Deferred);
+    TEST_ASSERT_FALSE(isOn(RelayId::Light));
+    g_ctl.update(withSoc(25.0f), 100000);
+    TEST_ASSERT_TRUE(isOn(RelayId::Light));
+}
+
+/// Override schaltet nur gewünschte Relais ein (bewusst ausgeschaltetes
+/// Licht bleibt aus).
+void test_override_respects_off_request()
+{
+    g_ctl.request(RelayId::Light, false, Local, withSoc(50.0f), 1000);
+    g_ctl.setOverride(true, withSoc(50.0f), 2000);
+    TEST_ASSERT_FALSE(isOn(RelayId::Light));
+    TEST_ASSERT_TRUE(isOn(RelayId::Fridge));
 }
 
 /// millis()-Überlauf bei der Mindest-Auszeit
@@ -278,7 +314,6 @@ void test_balcony_profile()
 
     TEST_ASSERT_FALSE(isOn(RelayId::Light));    // R2/R3 deaktiviert
     TEST_ASSERT_FALSE(isOn(RelayId::Fridge));
-    TEST_ASSERT_TRUE(g_ctl.request(RelayId::Main, true, Local, withSoc(80.0f), 100) == CommandResult::RejectedSource);
     TEST_ASSERT_TRUE(g_ctl.request(RelayId::Light, true, Mqtt, withSoc(80.0f), 100) == CommandResult::RejectedDisabled);
 
     TEST_ASSERT_TRUE(g_ctl.request(RelayId::Main, true, Mqtt, withSoc(80.0f), 1000) == CommandResult::Accepted);
@@ -299,7 +334,7 @@ void test_balcony_remembers_request()
     TEST_ASSERT_FALSE(isOn(RelayId::Main));
     g_ctl.update(withSoc(30.0f), 4000);
     TEST_ASSERT_TRUE(isOn(RelayId::Main));
-    TEST_ASSERT_EQUAL_STRING("gespeicherter Wunsch ausgeführt", g_ctl.status(RelayId::Main).reason);
+    TEST_ASSERT_EQUAL_STRING("SOC wieder ausreichend", g_ctl.status(RelayId::Main).reason);
 }
 
 /// BKW: Einschaltbefehl bei zu niedrigem SOC wird gespeichert.
@@ -335,7 +370,7 @@ int runAllTests()
     RUN_TEST(test_startup_state);
     RUN_TEST(test_startup_without_shunt_keeps_small_loads);
     RUN_TEST(test_inverter_switch_on_and_off_by_command);
-    RUN_TEST(test_inverter_source_not_allowed);
+    RUN_TEST(test_command_sources);
     RUN_TEST(test_inverter_locked_below_25);
     RUN_TEST(test_running_inverter_keeps_running_until_15);
     RUN_TEST(test_inverter_hysteresis);
@@ -345,7 +380,9 @@ int runAllTests()
     RUN_TEST(test_light_off_below_15_on_from_20_after_min_off_time);
     RUN_TEST(test_fridge_off_below_5_on_from_10);
     RUN_TEST(test_light_stays_off_when_shunt_lost_afterwards);
-    RUN_TEST(test_automatic_relay_rejects_commands);
+    RUN_TEST(test_light_switchable_by_command);
+    RUN_TEST(test_light_command_deferred_when_locked);
+    RUN_TEST(test_override_respects_off_request);
     RUN_TEST(test_min_off_time_overflow);
     RUN_TEST(test_override_bypasses_all_locks);
     RUN_TEST(test_override_end_applies_rules_immediately);
