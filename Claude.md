@@ -53,7 +53,7 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 ### Bestätigte Fakten (vom Projektinhaber)
 - UART1: RX GPIO16 / TX GPIO17. UART2: RX GPIO26 / **TX GPIO33** (der Code ist maßgeblich; die Angabe GPIO27 in `ESP32_Pinbelegung.xlsx` ist veraltet).
 - Pegel über Pegelwandler angepasst (MPPT sendet 5 V, SmartShunt 3,3 V). Derzeit **ohne galvanische Trennung**, gemeinsames Potential. Trennung evtl. später (dann neue Pegelwandler nötig).
-- SmartShunt sendet PID **0xC035** (nicht in VE.Direct-Protokoll 3.34 gelistet), Firmware 419. SmartSolar MPPT 100/50 sendet PID 0xA057.
+- SmartShunt sendet PID **0xC035** (nicht in VE.Direct-Protokoll 3.34 gelistet), Firmware 419 (seit 09.11.2026: 4.20). SmartSolar MPPT 100/50 sendet PID 0xA057.
 - Parser, FieldCatalog, Interpreter wurden in Commit `04a0b80` **bewusst entfernt** (Fehler in der seriellen Ausgabe, Ursache ungeklärt). Neuanfang ab Rohdatenausgabe. Der alte Code in Commit `0d5d648` dient nur als Referenz.
 - StateBuilder-Klassen existieren lokal außerhalb des Repos; ob sie übernommen werden, ist offen.
 - Ziel: Jedes Gerät soll an jedem UART funktionieren (Erkennung über PID, pro Kanal).
@@ -280,10 +280,86 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
   - E-Paper: MQTT-Symbol, sobald eingerichtet.
   - **Offene Fragen:** (1) Broker: wo, Benutzer/Passwort, TLS nötig? (2) Topic-Schema `vedirect/…` oder `vedirect/<Gerätename>/…`, vorhandenes Schema in Node-RED? (3) Einzelne Topics oder JSON je Bereich? (4) Befehle nur R1 oder auch R2/R3/Override? (5) Intervall 10 s + sofort bei Änderung?
 - **W4:** Projektseiten (Live-Werte, Relais, Override, Schwellen, **Statusmeldungen**), Sicherung/Wiederherstellung.
+  - **Festgelegt 09.11.2026 (Projektinhaber):**
+    - Reiter: **Übersicht** (wie Display + Schalter R1–R3/Override), **Shunt**, **MPPT**, **Historie**, **Einstellungen** (mind. einer; zuerst eigene Relais-Schwellen), **Fehler** (eigener Reiter für Fehleranzeigen/Meldungen), dazu **ein Sammelreiter „System“** mit WLAN, MQTT, Gerät, Update.
+    - **W4a** ohne HEX: Live-Werte, Historie aus Textprotokoll (Shunt H1–H18, MPPT H19–H23), Relais/Override schalten, eigene Schwellen einstellen/speichern, Fehler/Meldungen.
+    - **W4b** HEX nur **lesen**: MPPT-30-Tage-Historie (`0x1050`–`0x106E`, Summe `0x104F`), aktuelle Shunt- und MPPT-Einstellungen anzeigen. Vorher am Gerät prüfen, ob Text-Frames bei HEX-Verkehr pausieren (FAQ Q7); DeviceDetector/LinkMonitor müssen HEX-Pausen kennen.
+    - **W4a Details (Projektinhaber 09.11.2026):**
+      - Änderbar je Relais: Sperre unter, Aus unter, Frei ab (%), Mindest-Auszeit, Zustand nach Neustart, nach Schutzabschaltung automatisch wieder ein. Nicht änderbar: Sicherheitslogik ohne SOC, Relais aktiv/deaktiviert, Namen.
+      - Override: Relais immer schaltbar (außer in der Anlage deaktivierte). **Verantwortung beim Benutzer → deutlich in die Bedienungsanleitung.**
+      - Ereignisliste im RAM (50 Einträge), Zeit als Laufzeit, bis die RTC kommt.
+      - Aktualisierung Standard 5 s, im Browser wählbar (2/5/10/30 s, je Browser gespeichert); nach Schaltbefehlen sofort.
+      - Sicherung/Wiederherstellung: später.
+      - Anlage Camper/Balkonkraftwerk in der WebUI: Auswahl unter Einstellungen, lädt Voreinstellung, Neustart (bestätigt 09.11.2026, umgesetzt in Schritt 5).
+      - RTC (W4e/W5): interne Uhr + Stellen per NTP/Browserzeit, oder DS3231 mit Knopfzelle (Hardware, 2 Pins I2C) – noch zu entscheiden.
+    - **W4a Schritt 1 (09.11.2026, umgesetzt, Test durch Projektinhaber offen):**
+      - `WebUi::addApi(path, Method, handler)` + `ApiRequest`: Projekt-Endpunkte ohne WebServer-Abhängigkeit, Login/Sperre prüft WebUi. Anmelden vor `begin()` (main.cpp: `registerProjectApi()`).
+      - `GET /api/live` = `{"battery","pv","relays","system"}`, dieselben JSON-Bausteine wie MQTT.
+      - Oberfläche: Hauptreiter Übersicht, Shunt, MPPT, Historie, Fehler (mit Zähler-Markierung, noch ohne Funktion), Einstellungen, System (Unterreiter Info, WLAN, MQTT, Gerät, Update). Projekt-Reiter vorerst Platzhalter. Gewählter Reiter wird im Browser gemerkt (localStorage, fehlertolerant).
+      - Test Schritt 1 durch Projektinhaber: ✓ (09.11.2026)
+    - **W4a Schritt 2 (09.11.2026, umgesetzt, Test offen):** Übersicht (Batterie, Solar, Verbraucher R1–R3 mit Ein/Aus, Override mit Sicherheitsabfrage, Verbindung).
+      - `POST /api/relay` (relay=1..3, on), `POST /api/override` (on): Befehl über die Queue (Quelle WebUi) mit `ticket`; Handler wartet max. 500 ms auf genau diesen Befehl und liefert Ergebnistext + aktuelles Live-JSON.
+      - `/api/live` zusätzlich `limits` (Schwellen je Relais, aus `ControlSnapshot::configs`).
+      - `/api/status` enthält über `setStatusExtension` `faults:{count,severity}` → Zähler am Reiter „Fehler“ und rotes Banner bei kritischem Fehler auf allen Reitern.
+      - Ein gemeinsamer Aktualisierungstakt (Status + aktiver Reiter), Standard 5 s, Auswahl 2/5/10/30 s in der Fußzeile (je Browser), pausiert im Hintergrund.
+      - Test Schritt 2 durch Projektinhaber: ✓ (09.11.2026). Wunsch: Override-Zustand in Großbuchstaben („AUS“) → umgesetzt.
+    - **W4a Schritt 3 (09.11.2026, umgesetzt, Test offen):** Reiter Shunt, MPPT, Historie.
+      - `GET /api/device?role=shunt|mppt`: Gerät, PID, UART, Alter letzter Block, Verbindungsstatistik (seit Start), alle empfangenen Felder mit Klarname, formatiertem Wert (ValueFormatter, Dezimalkomma), Alter und `history` (Label H + Ziffer).
+      - DeviceState/LinkMonitor werden unter `stateMutex` in statische Kopien der webTask kopiert (~5 KB, nicht auf den Stack).
+      - Werte älter als 10 s werden grau mit „vor x s“ angezeigt.
+      - Test Schritt 3 durch Projektinhaber (09.11.2026): funktioniert, intensiver Test später. Findings → umgesetzt:
+        - Zähler am Reiter „Fehler“ war bei Info-Fehlern (MPPT fehlt) grau, nach Wiederanstecken rot (Warnung „instabil“, 2 min). Für den Benutzer unverständlich → **jeder aktive Fehler rot**, unabhängig von der Schwere.
+        - Interne Victron-Kürzel (PID, FW, H19 …) neben den Klarnamen entfallen; Produkt-ID im Kopf entfällt (steht als Messwert in der Liste).
+    - **W4a Schritt 4 (09.11.2026, umgesetzt, Test offen):** Reiter „Fehler“.
+      - Neu `lib/System/EventLog` (Ringpuffer 50 × 96 Byte, neueste zuerst, fortlaufende Nummer, UTF-8-sicheres Kürzen), Tests `test/test_event_log` (7 Tests; gesamt 99/99).
+      - main.cpp: `addEvent()` (Spinlock `g_eventLock`). Ereignisse: Start mit Neustart-Grund (`esp_reset_reason`, Absturz/Watchdog/Brownout = kritisch), Rückfall auf alte Firmware, Gerät erkannt/gewechselt/ausgefallen (in `publish()`), Relais EIN/AUS mit Quelle bzw. Grund (automatisch AUS = Warnung), abgelehnte/gespeicherte Befehle, Override, Fehler aufgetreten/behoben (erst nach 10 s Laufzeit, Startrauschen).
+      - `GET /api/faults`: aktive Fehler mit Schwere, MPPT-Fehlertext (ERR), Shunt-Alarmgrund (AR, nur bei Batteriealarm), Neustart-Grund, Laufzeit, Ereignisse.
+      - Stack UART- und System-Task 4 → 6 KB (vsnprintf in addEvent).
+      - Test Schritt 4 durch Projektinhaber (09.11.2026, Teiltest):
+        - Shunt ab → kritischer Fehler, Relais gesperrt ✓. Shunt an → Spannung wieder da, Relais frei ✓.
+        - `absturz` → Neustart-Grund „Absturz“ rot/kritisch: **so gewollt** (ungeplanter Neustart, Relais waren kurz aus).
+        - Vermutetes Finding „Shunt erneut abgezogen während Entprellung → kein Fehler“: vom Projektinhaber am 10.11.2026 **nicht reproduzierbar**, alles wie beschrieben → kein Fehler. Wahrscheinlich zu kurz gewartet.
+        - Reaktionszeit nach Abziehen (aus dem Code): Timeout 5 s ab letztem Block mit PID (`deviceTimeoutMs`), Auswertung 1-s-Takt, E-Paper sofort (~1 s Zeichnen), WebUI nach Abfragetakt → Display ca. 5–7 s, WebUI ca. 5–8 s (bei 2 s Takt).
+    - **W4a Schritt 5 (10.11.2026, umgesetzt, Test offen):** Reiter „Einstellungen“.
+      - `RelayLimits` in LoadController (Sperre/Aus/Frei, Mindest-Auszeit, Zustand nach Neustart, automatisch wieder ein) mit `validate()` (0 ≤ Aus ≤ Sperre ≤ Frei ≤ 100, Auszeit ≤ 3600 s) und `LoadController::setLimits()`; neues Ergebnis `RejectedInvalid`. 6 neue Tests (gesamt 105/105).
+      - NVS: `app/install` (0 Camper, 1 Balkon, gelesen in `setup()`), `relays/r<n>.{lock,off,rel,minoff,start,auto,set}` (SOC in Zehntel-%). Fehlt `set` → Voreinstellung. Ungültige gespeicherte Werte → Voreinstellung + Warnereignis.
+      - Änderung läuft als `CommandKind::Limits`/`ResetLimits` über die Befehlsqueue (nur die systemTask ändert die Konfiguration); danach sofort `update()` → evtl. Abschaltung erscheint als automatische Relaisänderung. Gespeichert wird erst nach Annahme durch die systemTask.
+      - API: `GET /api/settings`, `POST /api/settings/relay`, `POST /api/settings/defaults` (ohne Neustart), `POST /api/settings/installation` (löscht `relays`, Neustart über neues `WebUi::requestRestart()`).
+      - Ereignisse: Einstellungen geändert (mit Werten), zurückgesetzt, Anlage gewechselt.
+      - Nicht änderbar (fest angezeigt): Verhalten ohne SOC, aktiv/deaktiviert, Namen.
+      - Hinweis Umgebung: `pio test -e native` nur aus PowerShell; unter Git Bash bricht g++ (msys64) ohne Meldung ab.
+      - Test Projektinhaber 10.11.2026 (`26.11.10-1746`): Anzeige der Werte ✓, ungültige Werte abgelehnt ✓, Anlagenwechsel mit Neustart ✓.
+      - **OFFENE TESTS (brauchen dynamischen SOC → Stichwort „Shunt-Simulator“, gegen Projektende):** sofortige Wirkung geänderter Schwellen (Abschaltung bei SOC unter neuer Aus-Schwelle), Erhalt der Werte nach Neustart mit Wirkung, „Alle Relais auf Voreinstellung“, Einzel-Rücksetzen, Hysterese/Mindest-Auszeit/automatisch wieder ein.
+      - Erweiterung (Wunsch Projektinhaber 10.11.2026, umgesetzt in `26.11.10-1804`): **einzelnes Relais auf Voreinstellung** (Knopf je Relais, nur sichtbar wenn „geändert“). `POST /api/settings/defaults` mit optionalem `relay=1..3`; löscht nur die NVS-Schlüssel dieses Relais. Damit ist Schritt 5 aus Sicht des Projektinhabers fertig.
+      - **Finding 10.11.2026 (`26.11.10-1804`): WebUI lädt nicht** (keine Reiterinhalte, auch nach F5). Ursache: Claude hat app.js per Python-Heredoc über die Bash geändert; dabei wurde `\\n` zu einem echten Zeilenumbruch in einem JS-String → Syntaxfehler, das ganze Skript lief nicht. Abhilfe: korrigiert in `26.11.10-1819`. Künftig Dateiänderungen nur mit dem Edit-Werkzeug, keine Escape-Sequenzen über Bash-Heredocs.
+      - Test Projektinhaber 10.11.2026 (FW `26.11.10-1804`, WebUI `26.11.10-1844` per USB/uploadfs): Einzel-Rücksetzen ✓ (Knopf nur bei „geändert“ sichtbar, so gewollt). **Schritt 5 abgeschlossen** (offene SOC-Tests siehe oben, Shunt-Simulator).
+    - **W4a Schritt 6 (10.11.2026): Abschluss.** Bedienungsanleitung auf Stand FW `26.11.10-1804` / WebUI `26.11.10-1819`: Kapitel 3 (Reiterübersicht, Aktualisierung, Markierungen, Reiter „Fehler“ mit Ereignisliste und Reaktionszeit), Kapitel 7 neu gegliedert (7.1 Schalten, 7.2 Schwellen, 7.3 Override mit **Verantwortung beim Benutzer**, 7.4 Relais-Einstellungen, 7.5 Anlage, 7.6 Sicherheit), neue Pfade *System → …*, Kapitel 10 ergänzt um **10.1 Notweg WebUI per USB (uploadfs)** inkl. COM-Port-belegt-Hinweis. MQTT unverändert (keine neuen Topics; Einstellungen nur per WebUI).
+    - **✅ W4a ABGESCHLOSSEN (10.11.2026).** Offen nur die SOC-abhängigen Tests aus Schritt 5 (Shunt-Simulator, gegen Projektende) und der intensive Test von Schritt 3. Nächste Stufe laut Plan: **W4b** (HEX nur lesen).
+    - Offen (Projektinhaber 10.11.2026): Notweg Update per `curl` über WLAN hat nicht funktioniert, Ursache unbekannt (Ausgabe von curl fehlt noch).
+    - **W4c bleibt leer** (Projektinhaber 09.11.2026). Reserviert für: **HEX-Schreiben am MPPT**, falls später doch gewünscht. Derzeit MPPT nur lesen, Einstellungen über VictronConnect.
+    - **MPPT-Einstellungen nur lesen**, schreiben nur über VictronConnect (NVM-Verschleiß, Ladespannung kann LiFePO4 schädigen).
+    - **W4d** Shunt-Einstellungen: separat entscheiden; evtl. nur wenige Befehle (z. B. Historie löschen `0x1030`, SOC synchronisieren `0x102C`) mit Bestätigung.
+    - **W4e oder W5:** Echtzeituhr (RTC/NTP), danach Meldungen mit Uhrzeit.
+  - Quellen HEX: `docs/VeDirect-Doku/Victron_BlueSolar-SmartSolar-MPPT-HEX-protocol_Rev18.pdf`, `docs/VeDirect-Doku/Victron_BMV-7xx-SmartShunt-HEX-protocol_Rev7.pdf` (BMV-700-Doku; SmartShunt-Abweichungen am Gerät prüfen).
+- **Test 09.11.2026 (Projektinhaber): SmartShunt auf FW 4.20 geflasht** während des Betriebs. Verhalten wie festgelegt: Wechselrichter (R1, war EIN) fiel ab, SOC und Strom „--“, Spannung ca. 13,45 V mit `*` (Ersatzwert vom MPPT), Warndreieck kritisch. ✓
 - **E-Paper mit Symbolen (umgesetzt 08.11.2026):** Symbolleiste: WLAN-Balken (4 Stufen nach RSSI, durchgestrichen ohne WLAN), AP (schwarz = an, durchgestrichen = aus), MQTT (nur bei WLAN + eingerichtetem MQTT, ab W3), OVR (nur bei Override), Warndreieck (gefüllt = kritisch, leer = Warnung). Lade-/Entladepfeil am SOC (▲ lädt, ▼ entlädt, o Ruhe bei |I| < 0,05 A). Untere Zeile: Shunt/MPPT ● ok, ◐ instabil, ⊗ defekt. Textliche Statuszeile entfällt (Details → WebUI). Sofort aktualisiert: Symbole/Zustände/Relais; WLAN-Balken und Pfeil im 30-s-Takt mit den Werten.
 - MPPT-Simulator: GND war laut Projektinhaber immer verbunden; Ursache der Prüfsummenfehler nach der Umstellung auf USB-Versorgung noch offen → weiter beobachten.
 - Später: ESP8266-Variante von `lib/WebCore`, Uhrzeit (RTC/NTP), ESP-NOW-Bediengerät, Shunt-Konfiguration (HEX-Protokoll).
 - **Am Ende: kurze Anleitung** für Bedienung (Ersteinrichtung, WLAN, Passwort, Reset-Taste, Updates, Relais/Override) – Wunsch Projektinhaber 08.11.2026.
+  - **PFLICHT (Projektinhaber 09.11.2026): alle MQTT-Messwerte und alle Schaltbefehle** müssen in die Anleitung. Stand 09.11.2026 (Basis-Topic einstellbar, Standard `vedirect`):
+    - Senden (retained, JSON, ungültig = `null`):
+      - `vedirect/status` = `online` / `offline` (Letzter Wille, ca. 45 s nach Ausfall)
+      - `vedirect/battery` = `soc` (%), `voltage` (V), `voltageSource` (`shunt`/`mppt`/`none`), `current` (A, + laden / − entladen), `power` (W), `consumedAh` (Ah), `timeToGoMin` (min), `timeToGoInfinite` (true = keine Entladung)
+      - `vedirect/pv` = `power` (W), `voltage` (V), `yieldTodayKWh` (kWh), `state` (Text), `stateCode` (CS-Code), `errorCode` (ERR)
+      - `vedirect/relays` = `r1`/`r2`/`r3` (`ON`/`OFF`/`DISABLED`), je Relais `…Name`, `…Locked` (gesperrt), `…Wanted` (Schaltwunsch), `…Reason` (Grund), `override` (`ON`/`OFF`)
+      - `vedirect/system` = `faults` (Bitmaske hex), `severity` (`none`/`info`/`warning`/`critical`), `faultTexts` (Liste), `shunt`/`mppt` (`ok`/`instabil`/`defekt`), `firmware`, `uptimeS`, `rssi` (dBm)
+      - `vedirect/command-result` (nicht retained) = `command`, `value`, `result` (z. B. „ausgeführt“, „abgelehnt: SOC zu niedrig …“, „gespeichert, wird bei ausreichendem SOC ausgeführt“)
+    - Befehle (Payload `ON`/`OFF`, auch `1`/`0`, `true`/`false`, `EIN`/`AUS`; Groß/klein egal):
+      - `vedirect/relay/r1-set` (Wechselrichter bzw. DC-DC), `vedirect/relay/r2-set` (Licht), `vedirect/relay/r3-set` (Kühlschrank), `vedirect/override-set`
+      - Hinweise: SOC-Schutz gilt immer (außer Override); Befehle in Node-RED **ohne Retain** senden (sonst nach Neustart erneut ausgeführt); Sendeintervall Standard 10 s, bei Relais-/Override-/Fehleränderung sofort.
+    - Serieller Monitor (USB, Entwicklung): `r1|r2|r3 ein|aus`, `override ein|aus`, `bloecke ein|aus`, `hilfe` (Testbefehl `absturz` wird vor der Anleitung entfernt).
+    - Bei jeder späteren Änderung an Topics/Befehlen diese Liste mitpflegen.
+  - **Begonnen 09.11.2026: `docs/Bedienungsanleitung.md`** (gepflegt, im Gegensatz zu den alten `docs/*.md`). Gliederung: Überblick, Ersteinrichtung, WebUI, WLAN, Passwort/Reset-Taste, E-Paper, Relais/Override, Updates, **MQTT (vollständig)**, Fehlerbehebung, Anhang (Fehlerwort, Monitor). Platzhalter „folgt“ für W4 u. a. **Bei jeder Stufe mitpflegen.**
 
 ### Code-Stil
 - Aussagekräftige Kommentare im Code (Wunsch des Projektinhabers).

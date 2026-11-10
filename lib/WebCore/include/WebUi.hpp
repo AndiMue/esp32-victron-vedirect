@@ -39,6 +39,11 @@
  *   POST /api/mqtt/reset    MQTT-Einstellungen löschen
  *   Zustand auch in /api/status ("mqtt").
  *
+ * Projekt-Endpunkte (W4a): Das Projekt meldet eigene APIs mit addApi() an
+ * (VOR begin()). WebCore bleibt dadurch projektneutral (Basis auch für
+ * andere Projekte und die spätere ESP8266-Variante). Login und Sperre
+ * prüft WebUi selbst, der Handler liefert nur Statuscode und JSON.
+ *
  * Nur aus EINER Task verwenden (Web-Task): begin(), dann loop().
  ******************************************************************************/
 
@@ -47,11 +52,21 @@
 #include <Arduino.h>
 #include <atomic>
 #include <functional>
+#include <vector>
 
 #include "UpdateManager.hpp"
 
 class WifiManager;
 class MqttManager;
+
+/// Lesezugriff auf die Parameter einer Anfrage (Formular- oder URL-
+/// Parameter). Gilt nur während des Handler-Aufrufs.
+class ApiRequest
+{
+public:
+    String arg(const char* name) const;
+    bool   hasArg(const char* name) const;
+};
 
 class WebUi
 {
@@ -64,10 +79,28 @@ public:
     /// für ein Objekt-Inneres liefern, z. B. "\"soc\":95.0" (ohne Klammern).
     using StatusExtension = std::function<String()>;
 
+    /// Projekt-Endpunkt: füllt responseJson (vollständiges JSON) und gibt den
+    /// HTTP-Statuscode zurück (z. B. 200, 400). Läuft in der Web-Task.
+    using ApiHandler = std::function<int(const ApiRequest& request, String& responseJson)>;
+
+    enum class Method : uint8_t { Get, Post };
+
     void begin(WifiManager& wifi, const char* deviceName, const char* firmwareVersion);
     void loop(uint32_t nowMs);
 
     void setStatusExtension(StatusExtension extension) { m_extension = extension; }
+
+    /// Projekt-Endpunkt anmelden (vor begin()). path z. B. "/api/live".
+    void addApi(const char* path, Method method, ApiHandler handler);
+
+    /// Neustart anfordern (z. B. aus einem Projekt-Endpunkt). Wird in loop()
+    /// nach delayMs ausgeführt, damit die Antwort noch ausgeliefert wird.
+    /// Nur aus der Web-Task aufrufen.
+    void requestRestart(uint32_t delayMs = 1000)
+    {
+        m_restartPending = true;
+        m_restartAtMs    = millis() + delayMs;
+    }
 
     /// MQTT-Verwaltung einbinden (optional, vor begin() aufrufen).
     void setMqtt(MqttManager* mqtt) { m_mqtt = mqtt; }
@@ -103,6 +136,14 @@ private:
     String mqttStatusJson() const;
 
     MqttManager*      m_mqtt = nullptr;
+
+    struct ProjectApi
+    {
+        String     path;
+        Method     method;
+        ApiHandler handler;
+    };
+    std::vector<ProjectApi> m_projectApis;
 
     UpdateManager     m_update;
     bool              m_uploadAuthorized = false;

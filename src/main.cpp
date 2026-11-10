@@ -34,8 +34,10 @@
 
 #include <Arduino.h>
 
+#include <cstdarg>
 #include <cstring>
 
+#include "esp_system.h"     // esp_reset_reason()
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -46,6 +48,7 @@
 
 #include "BuildVersion.h"   // FW_VERSION, erzeugt von tools/build_version.py
 #include "MqttManager.hpp"
+#include "SettingsStore.hpp"
 #include "RelayDriver.hpp"
 #include "StatusDisplay.hpp"
 #include "UpdateManager.hpp"
@@ -57,6 +60,7 @@
 #include "DeviceDetector.hpp"
 #include "DeviceState.hpp"
 #include "LinkMonitor.hpp"
+#include "EventLog.hpp"
 #include "LoadController.hpp"
 #include "SystemState.hpp"
 #include "ValueConverter.hpp"
@@ -112,8 +116,10 @@ const RelayPin RelayPins[RelayCount] =
     { 32, true },   // R3 Kühlschrank
 };
 
-constexpr uint32_t UartTaskStack    = 4096;
-constexpr uint32_t SystemTaskStack  = 4096;
+// W4a: UART- und System-Task von 4 auf 6 KB, da sie jetzt über addEvent()
+// vsnprintf aufrufen (braucht selbst gut 1 KB Stack)
+constexpr uint32_t UartTaskStack    = 6144;
+constexpr uint32_t SystemTaskStack  = 6144;
 constexpr uint32_t DisplayTaskStack = 6144;   ///< Grafik/Schriften
 constexpr uint32_t LoggerTaskStack = 6144;   ///< printf/snprintf mit Formatierung braucht etwas mehr
 
@@ -235,6 +241,58 @@ QueueHandle_t g_logQueue = nullptr;
 /// Schützt alle ChannelStatus-Strukturen (sehr kurze Kopiervorgänge).
 portMUX_TYPE g_statusLock = portMUX_INITIALIZER_UNLOCKED;
 
+/******************************************************************************
+ * W4a Schritt 4: Ereignisliste (Reiter "Fehler" der WebUI)
+ *
+ * Wird aus mehreren Tasks beschrieben (UART-Tasks: Geräte erkannt/
+ * ausgefallen; systemTask: Relais, Befehle, Fehler) und von der webTask
+ * gelesen -> eigener Spinlock, nur kurze Kopien darin.
+ ******************************************************************************/
+EventLog     g_events;
+portMUX_TYPE g_eventLock = portMUX_INITIALIZER_UNLOCKED;
+
+/// Ereignis eintragen (printf-Format, Text wird ggf. gekürzt).
+void addEvent(Severity severity, const char* format, ...)
+{
+    char text[EventLog::TextSize];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+
+    const uint32_t now = millis();
+    portENTER_CRITICAL(&g_eventLock);
+    g_events.add(now, severity, text);
+    portEXIT_CRITICAL(&g_eventLock);
+}
+
+/// Grund des letzten Neustarts (esp_reset_reason) als Klartext + Schwere.
+const char* resetReasonText(esp_reset_reason_t reason, Severity& severity)
+{
+    severity = Severity::Info;
+    switch (reason)
+    {
+        case ESP_RST_POWERON:   return "Einschalten (Stromversorgung)";
+        case ESP_RST_EXT:       return "Reset von außen (EN-Taste)";
+        case ESP_RST_SW:        return "Neustart durch die Software (z. B. Update, Neustart-Knopf)";
+        case ESP_RST_DEEPSLEEP: return "Aufwachen aus dem Tiefschlaf";
+        case ESP_RST_SDIO:      return "Reset über SDIO";
+        default: break;
+    }
+    severity = Severity::Critical;
+    switch (reason)
+    {
+        case ESP_RST_PANIC:     return "Absturz (Software-Fehler)";
+        case ESP_RST_INT_WDT:   return "Watchdog: Programm hing (Interrupt)";
+        case ESP_RST_TASK_WDT:  return "Watchdog: Programm hing (Task)";
+        case ESP_RST_WDT:       return "Watchdog: Programm hing";
+        case ESP_RST_BROWNOUT:  return "Unterspannung der Versorgung (Brownout)";
+        default:                return "unbekannt";
+    }
+}
+
+esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;   ///< in setup() gesetzt
+
 /// Empfangspuffer der Logger-Task (global statt auf dem Stack).
 LogMessage g_incoming;
 
@@ -265,7 +323,9 @@ SystemState readSystemState()
 enum class CommandKind : uint8_t
 {
     Relay,      ///< Relais ein/aus
-    Override    ///< Override ein/aus
+    Override,   ///< Override ein/aus
+    Limits,     ///< W4a: änderbare Werte eines Relais setzen (WebUI)
+    ResetLimits ///< W4a: Relais auf die Voreinstellung der Anlage (alle oder eins, siehe allRelays)
 };
 
 struct ControlCommand
@@ -274,6 +334,9 @@ struct ControlCommand
     RelayId       relay  = RelayId::Main;
     bool          on     = false;
     CommandSource source = CommandSource::Local;
+    uint32_t      ticket = 0;   ///< W4a: laufende Nummer (WebUI wartet auf genau diesen Befehl), 0 = keine
+    RelayLimits   limits;       ///< W4a: nur bei CommandKind::Limits
+    bool          allRelays = true;   ///< W4a: ResetLimits für alle Relais (sonst nur "relay")
 };
 
 struct ControlSnapshot
@@ -282,6 +345,7 @@ struct ControlSnapshot
     const char*    names[RelayCount]   = {};
     const char*    shortNames[RelayCount] = {};
     bool           enabled[RelayCount] = {};
+    RelayConfig    configs[RelayCount];        ///< W4a: Schwellen für die Anzeige (WebUI)
     bool           overrideActive      = false;
     uint32_t       commandCount        = 0;    ///< bearbeitete Befehle
     ControlCommand lastCommand;
@@ -371,6 +435,28 @@ void publish(Channel& channel, LogKind kind, uint32_t now,
     }
     const ChannelStatus snapshot = channel.status;
     portEXIT_CRITICAL(&g_statusLock);
+
+    // W4a: Geräteereignisse in die Ereignisliste (WebUI, Reiter "Fehler")
+    if (kind == LogKind::DeviceIdentified || kind == LogKind::DeviceChanged ||
+        kind == LogKind::DeviceLost)
+    {
+        const DeviceDetector::Identity& cur  = channel.detector.identity();
+        const DeviceDetector::Identity& prev = channel.detector.previousIdentity();
+        const char* curName  = cur.device  ? cur.device->name  : cur.productId;
+        const char* prevName = prev.device ? prev.device->name : prev.productId;
+        if (kind == LogKind::DeviceIdentified)
+        {
+            addEvent(Severity::Info, "%s: %s erkannt", channel.name, curName);
+        }
+        else if (kind == LogKind::DeviceChanged)
+        {
+            addEvent(Severity::Warning, "%s: Gerät gewechselt von %s zu %s", channel.name, prevName, curName);
+        }
+        else
+        {
+            addEvent(Severity::Warning, "%s: %s ausgefallen (keine Daten mehr)", channel.name, prevName);
+        }
+    }
 
     LogMessage& msg   = channel.outgoing;
     msg.kind           = kind;
@@ -541,6 +627,7 @@ void publishControl(const ControlCommand* command, CommandResult result)
         snapshot.names[i]   = g_loadController.config().relays[i].name;
         snapshot.shortNames[i] = g_loadController.config().relays[i].shortName;
         snapshot.enabled[i] = g_loadController.config().relays[i].enabled;
+        snapshot.configs[i] = g_loadController.config().relays[i];
     }
     snapshot.overrideActive = g_loadController.overrideActive();
 
@@ -587,17 +674,267 @@ SystemState evaluateSystem()
 }
 
 /******************************************************************************
+ * W4a Schritt 4: Ereignisse der systemTask
+ ******************************************************************************/
+/// Fehler erst nach dieser Zeit protokollieren: Beim Start sind die Geräte
+/// noch nicht erkannt ("fehlt" wäre nur Startrauschen).
+constexpr uint32_t FaultLogGraceMs = 10000;
+
+const char* sourceText(CommandSource source)
+{
+    switch (source)
+    {
+        case CommandSource::Local: return "lokal";
+        case CommandSource::WebUi: return "WebUI";
+        case CommandSource::Mqtt:  return "MQTT";
+    }
+    return "?";
+}
+
+/// Relais-Zustand merken (vor einer Änderung).
+void captureRelays(bool on[RelayCount])
+{
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        on[i] = g_loadController.status(static_cast<RelayId>(i)).on;
+    }
+}
+
+/// Geänderte Relais protokollieren. command = auslösender Befehl oder nullptr
+/// (Automatik: Schutzabschaltung, Freigabe, Start).
+void logRelayChanges(const bool before[RelayCount], const ControlCommand* command)
+{
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const RelayStatus& st = g_loadController.status(static_cast<RelayId>(i));
+        if (st.on == before[i])
+        {
+            continue;
+        }
+        const char* name = g_loadController.config().relays[i].name;
+        if (command != nullptr)
+        {
+            addEvent(Severity::Info, "R%u %s %s (Befehl %s)", static_cast<unsigned>(i + 1), name,
+                     st.on ? "EIN" : "AUS", sourceText(command->source));
+        }
+        else
+        {
+            // Automatisch AUS = Schutzabschaltung -> Warnung
+            addEvent(st.on ? Severity::Info : Severity::Warning, "R%u %s %s: %s",
+                     static_cast<unsigned>(i + 1), name, st.on ? "EIN" : "AUS", st.reason);
+        }
+    }
+}
+
+/// Befehlsergebnis protokollieren, soweit es nicht schon als Relaisänderung
+/// erscheint (abgelehnt, gespeichert, Override).
+void logCommand(const ControlCommand& command, CommandResult result)
+{
+    if (command.kind == CommandKind::Override)
+    {
+        addEvent(command.on ? Severity::Warning : Severity::Info, "Override %s (Befehl %s)",
+                 command.on ? "EINGESCHALTET – Schutzsperren aufgehoben" : "ausgeschaltet",
+                 sourceText(command.source));
+        return;
+    }
+    if (command.kind == CommandKind::ResetLimits && !command.allRelays)
+    {
+        const size_t i = static_cast<size_t>(command.relay);
+        if (result != CommandResult::Accepted)
+        {
+            addEvent(Severity::Warning, "R%u Voreinstellung nicht übernommen: %s",
+                     static_cast<unsigned>(i + 1), LoadController::resultText(result));
+            return;
+        }
+        addEvent(Severity::Info, "R%u %s auf Voreinstellung zurückgesetzt (Befehl %s)",
+                 static_cast<unsigned>(i + 1), g_loadController.config().relays[i].name,
+                 sourceText(command.source));
+        return;
+    }
+    if (command.kind == CommandKind::ResetLimits)
+    {
+        addEvent(Severity::Info, "Relais-Einstellungen auf Voreinstellung zurückgesetzt (Befehl %s)",
+                 sourceText(command.source));
+        return;
+    }
+    if (command.kind == CommandKind::Limits)
+    {
+        const size_t i = static_cast<size_t>(command.relay);
+        const RelayLimits& l = command.limits;
+        if (result != CommandResult::Accepted)
+        {
+            addEvent(Severity::Warning, "R%u Einstellungen nicht übernommen: %s",
+                     static_cast<unsigned>(i + 1), LoadController::resultText(result));
+            return;
+        }
+        // Kurz halten: Ereignistexte sind auf 95 Byte begrenzt
+        addEvent(Severity::Info, "R%u %s geändert: Sperre %g, Aus %g, Frei %g %%, %lu s, Start %s, Auto %s",
+                 static_cast<unsigned>(i + 1), g_loadController.config().relays[i].name,
+                 l.lockBelowSoc, l.offBelowSoc, l.releaseAtSoc,
+                 static_cast<unsigned long>(l.minOffTimeMs / 1000),
+                 l.startupRequest ? "ein" : "aus", l.rememberRequest ? "ja" : "nein");
+        return;
+    }
+    if (result == CommandResult::Accepted)
+    {
+        return;   // erscheint als Relaisänderung (oder war schon so)
+    }
+    const size_t i = static_cast<size_t>(command.relay);
+    addEvent(result == CommandResult::Deferred ? Severity::Info : Severity::Warning,
+             "R%u %s %s (Befehl %s): %s", static_cast<unsigned>(i + 1),
+             g_loadController.config().relays[i].name, command.on ? "ein" : "aus",
+             sourceText(command.source), LoadController::resultText(result));
+}
+
+/// Fehlerbits vergleichen und Aufgetreten/Behoben protokollieren.
+void logFaultChanges(uint32_t faults, uint32_t& previous, bool& initialized)
+{
+    if (millis() < FaultLogGraceMs)
+    {
+        return;
+    }
+    const SystemConfig cfg = makeSystemConfig();
+    if (!initialized)
+    {
+        previous = 0;   // beim ersten Mal alle aktiven Fehler melden
+        initialized = true;
+    }
+    const uint32_t changed = faults ^ previous;
+    for (unsigned bit = 0; bit < SystemFault::BitCount; ++bit)
+    {
+        const uint32_t mask = 1u << bit;
+        if ((changed & mask) == 0)
+        {
+            continue;
+        }
+        if (faults & mask)
+        {
+            addEvent(SystemEvaluator::severityOf(mask, cfg), "Fehler: %s", SystemEvaluator::faultText(mask));
+        }
+        else
+        {
+            addEvent(Severity::Info, "Behoben: %s", SystemEvaluator::faultText(mask));
+        }
+    }
+    previous = faults;
+}
+
+/******************************************************************************
+ * W4a Schritt 5: Einstellungen im Flash (NVS)
+ *
+ *   Namensraum "app"    : "install" = Anlage (0 Camper, 1 Balkonkraftwerk)
+ *   Namensraum "relays" : je Relais n (1..3) die änderbaren Werte, nur wenn
+ *                         in der WebUI geändert ("rn.set" = true). SOC-Werte
+ *                         in Zehntel-Prozent, Auszeit in s.
+ * Fehlt ein Eintrag, gilt die Voreinstellung der Anlage. Beim Wechsel der
+ * Anlage und bei "Werkseinstellung" wird "relays" gelöscht.
+ ******************************************************************************/
+const char* const NvsApp    = "app";
+const char* const NvsRelays = "relays";
+
+/// Voreinstellung der aktuell gewählten Anlage.
+LoadControllerConfig presetConfig()
+{
+    return g_config.installation.load() == Installation::Balcony
+               ? LoadControllerConfig::balcony()
+               : LoadControllerConfig::camper();
+}
+
+/// NVS-Schlüssel "r<n>.<name>" (n = 1..3) bauen. Höchstens 15 Zeichen (NVS).
+String relayKey(size_t index, const char* name)
+{
+    return "r" + String(static_cast<unsigned>(index + 1)) + "." + name;
+}
+
+uint32_t socToTenths(float soc) { return static_cast<uint32_t>(soc * 10.0f + 0.5f); }
+
+/// Gespeicherte Werte eines Relais lesen. false = keine gespeichert.
+bool loadRelayLimits(size_t index, const RelayLimits& preset, RelayLimits& out)
+{
+    if (!SettingsStore::getBool(NvsRelays, relayKey(index, "set").c_str(), false))
+    {
+        return false;
+    }
+    out = preset;
+    out.lockBelowSoc    = SettingsStore::getUInt(NvsRelays, relayKey(index, "lock").c_str(),
+                                                 socToTenths(preset.lockBelowSoc)) / 10.0f;
+    out.offBelowSoc     = SettingsStore::getUInt(NvsRelays, relayKey(index, "off").c_str(),
+                                                 socToTenths(preset.offBelowSoc)) / 10.0f;
+    out.releaseAtSoc    = SettingsStore::getUInt(NvsRelays, relayKey(index, "rel").c_str(),
+                                                 socToTenths(preset.releaseAtSoc)) / 10.0f;
+    out.minOffTimeMs    = SettingsStore::getUInt(NvsRelays, relayKey(index, "minoff").c_str(),
+                                                 preset.minOffTimeMs / 1000) * 1000;
+    out.startupRequest  = SettingsStore::getBool(NvsRelays, relayKey(index, "start").c_str(),
+                                                 preset.startupRequest);
+    out.rememberRequest = SettingsStore::getBool(NvsRelays, relayKey(index, "auto").c_str(),
+                                                 preset.rememberRequest);
+    return true;
+}
+
+/// Werte eines Relais speichern (nur aus der webTask aufrufen).
+bool saveRelayLimits(size_t index, const RelayLimits& l)
+{
+    bool ok = true;
+    ok &= SettingsStore::putUInt(NvsRelays, relayKey(index, "lock").c_str(),   socToTenths(l.lockBelowSoc));
+    ok &= SettingsStore::putUInt(NvsRelays, relayKey(index, "off").c_str(),    socToTenths(l.offBelowSoc));
+    ok &= SettingsStore::putUInt(NvsRelays, relayKey(index, "rel").c_str(),    socToTenths(l.releaseAtSoc));
+    ok &= SettingsStore::putUInt(NvsRelays, relayKey(index, "minoff").c_str(), l.minOffTimeMs / 1000);
+    ok &= SettingsStore::putBool(NvsRelays, relayKey(index, "start").c_str(),  l.startupRequest);
+    ok &= SettingsStore::putBool(NvsRelays, relayKey(index, "auto").c_str(),   l.rememberRequest);
+    ok &= SettingsStore::putBool(NvsRelays, relayKey(index, "set").c_str(),    true);   // zuletzt
+    return ok;
+}
+
+/// Startkonfiguration: Voreinstellung der Anlage + gespeicherte Änderungen.
+/// Ungültige gespeicherte Werte werden verworfen (Voreinstellung, Warnung).
+LoadControllerConfig loadRelayConfig()
+{
+    LoadControllerConfig config = presetConfig();
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        RelayConfig& r = config.relays[i];
+        if (!r.enabled)
+        {
+            continue;
+        }
+        RelayLimits stored;
+        if (!loadRelayLimits(i, RelayLimits::from(r), stored))
+        {
+            continue;
+        }
+        if (stored.validate() != nullptr)
+        {
+            addEvent(Severity::Warning, "R%u %s: gespeicherte Einstellungen ungültig, Voreinstellung verwendet",
+                     static_cast<unsigned>(i + 1), r.name);
+            continue;
+        }
+        stored.applyTo(r);
+    }
+    return config;
+}
+
+/// Anlage aus dem NVS lesen (in setup(), vor dem Start der Tasks).
+void loadInstallation()
+{
+    const uint32_t v = SettingsStore::getUInt(NvsApp, "install", 0);
+    g_config.installation.store(v == 1 ? Installation::Balcony : Installation::Camper);
+}
+
+/******************************************************************************
  * System-Task: 1×/s Systemzustand + Abschaltlogik; Befehle sofort.
  ******************************************************************************/
 void systemTask(void*)
 {
-    // Relais-Voreinstellung je Anlage; Neustart = Normalbetrieb (kein Override,
-    // Wechselrichter aus, R2/R3 an)
-    g_loadController.setConfig(g_config.installation.load() == Installation::Balcony
-                                   ? LoadControllerConfig::balcony()
-                                   : LoadControllerConfig::camper());
+    // Relais-Voreinstellung je Anlage plus in der WebUI geänderte Werte (NVS);
+    // Neustart = Normalbetrieb (kein Override, Zustand nach Neustart je Relais)
+    g_loadController.setConfig(loadRelayConfig());
+    bool relaysBefore[RelayCount] = {};   // nach dem Einschalten ist alles aus
     g_loadController.start(millis());
     g_relays.apply(g_loadController);   // Startzustand ausgeben (R2/R3 ein)
+    logRelayChanges(relaysBefore, nullptr);
+
+    uint32_t loggedFaults = 0;
+    bool     faultsLogged = false;
     publishControl(nullptr, CommandResult::Accepted);
 
     esp_task_wdt_add(nullptr);          // diese Task vom Watchdog überwachen
@@ -618,10 +955,47 @@ void systemTask(void*)
         {
             const uint32_t now = millis();
             CommandResult result = CommandResult::Accepted;
+            captureRelays(relaysBefore);
 
             if (command.kind == CommandKind::Override)
             {
                 g_loadController.setOverride(command.on, state, now);
+            }
+            else if (command.kind == CommandKind::Limits || command.kind == CommandKind::ResetLimits)
+            {
+                if (command.kind == CommandKind::Limits)
+                {
+                    result = g_loadController.setLimits(command.relay, command.limits);
+                }
+                else if (!command.allRelays)
+                {
+                    // Ein Relais auf die Voreinstellung der Anlage, Zustand bleibt
+                    const size_t i = static_cast<size_t>(command.relay);
+                    result = g_loadController.setLimits(command.relay,
+                                                        RelayLimits::from(presetConfig().relays[i]));
+                }
+                else
+                {
+                    // Werkseinstellung: Voreinstellung der Anlage, Zustand bleibt
+                    const LoadControllerConfig preset = presetConfig();
+                    for (size_t i = 0; i < RelayCount; ++i)
+                    {
+                        if (preset.relays[i].enabled)
+                        {
+                            g_loadController.setLimits(static_cast<RelayId>(i),
+                                                       RelayLimits::from(preset.relays[i]));
+                        }
+                    }
+                }
+                // Neue Schwellen sofort anwenden; Folgen (z. B. Abschaltung)
+                // erscheinen als automatische Relaisänderung mit Grund.
+                publishControl(&command, result);
+                logCommand(command, result);
+                g_loadController.update(state, now);
+                g_relays.apply(g_loadController);
+                logRelayChanges(relaysBefore, nullptr);
+                publishControl(nullptr, CommandResult::Accepted);
+                continue;
             }
             else
             {
@@ -630,14 +1004,19 @@ void systemTask(void*)
             }
             g_relays.apply(g_loadController);   // sofort schalten
             publishControl(&command, result);
+            logCommand(command, result);
+            logRelayChanges(relaysBefore, &command);
             continue;   // weiter warten bis zur nächsten Auswertung
         }
 
         nextRun += pdMS_TO_TICKS(SystemIntervalMs);
 
         state = evaluateSystem();
+        logFaultChanges(state.faults, loggedFaults, faultsLogged);
+        captureRelays(relaysBefore);
         g_loadController.update(state, millis());
         g_relays.apply(g_loadController);
+        logRelayChanges(relaysBefore, nullptr);
         publishControl(nullptr, CommandResult::Accepted);
     }
 }
@@ -692,6 +1071,8 @@ DisplayData makeDisplayData()
  * neu starten. Schreibt nicht auf Serial (Meldungen über g_netStatus an
  * den Logger).
  ******************************************************************************/
+void registerProjectApi();   // W4a, definiert nach den JSON-Bausteinen (MQTT-Abschnitt)
+
 void webTask(void*)
 {
     // Dateisystem für die WebUI-Dateien (true = bei leerem/defektem
@@ -700,6 +1081,7 @@ void webTask(void*)
 
     g_wifi.begin(DefaultHostname, ApPrefix);
     g_webUi.setMqtt(&g_mqtt);   // W3: MQTT-Reiter und /api/mqtt
+    registerProjectApi();       // W4a: Projektseiten (/api/live, ...)
     g_webUi.begin(g_wifi, DeviceName, FirmwareVersion);
 
     bool stableConfirmed = false;
@@ -861,6 +1243,588 @@ String buildSystemJson(const SystemState& s, const NetStatus& net)
     j += ",\"rssi\":"       + String(net.rssi);
     j += "}";
     return j;
+}
+
+/******************************************************************************
+ * W4a: Projekt-Endpunkte der WebUI (laufen in der webTask)
+ *
+ *   GET  /api/live      {"battery":{..},"pv":{..},"relays":{..},"system":{..},
+ *                        "limits":[{"lock":25,"off":15,"release":30,"requiresSoc":true},..]}
+ *                       battery/pv/relays/system = gleiche Inhalte wie die
+ *                       MQTT-Topics, damit WebUI, MQTT und Anleitung
+ *                       übereinstimmen. limits = Schwellen je Relais.
+ *   POST /api/relay     relay=1..3, on=ON|OFF -> {"ok":..,"result":"..","live":{..}}
+ *   POST /api/override  on=ON|OFF             -> {"ok":..,"result":"..","live":{..}}
+ *
+ * Schaltbefehle laufen wie bei MQTT über die Befehlsqueue (Quelle WebUi);
+ * nur die systemTask schaltet. Der Handler wartet max. CommandWaitMs auf
+ * genau seinen Befehl (ticket) und meldet das Ergebnis direkt zurück.
+ *
+ * Login prüft WebUi. Daten nur über Kopien (readSystemState() usw.) lesen.
+ ******************************************************************************/
+constexpr uint32_t CommandWaitMs = 500;
+std::atomic<uint32_t> g_nextTicket{1};
+
+int parseOnOff(String payload);   // definiert weiter unten (MQTT)
+
+/// Schwellen je Relais als JSON-Array.
+String buildLimitsJson(const ControlSnapshot& c)
+{
+    String j = "[";
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const RelayConfig& r = c.configs[i];
+        if (i > 0) j += ",";
+        j += "{\"lock\":"        + String(r.lockBelowSoc, 1);
+        j += ",\"off\":"         + String(r.offBelowSoc, 1);
+        j += ",\"release\":"     + String(r.releaseAtSoc, 1);
+        j += ",\"requiresSoc\":" + String(r.requiresSoc ? "true" : "false");
+        j += ",\"minOffS\":"     + String(r.minOffTimeMs / 1000);
+        j += "}";
+    }
+    j += "]";
+    return j;
+}
+
+/// Gesamtes Live-JSON für die Übersicht.
+String buildLiveJson()
+{
+    const SystemState     state   = readSystemState();
+    const ControlSnapshot control = readControl();
+    const NetStatus       net     = readNetStatus();
+    String out;
+    out.reserve(1800);
+    out  = "{\"battery\":" + buildBatteryJson(state);
+    out += ",\"pv\":"      + buildPvJson(state);
+    out += ",\"relays\":"  + buildRelaysJson(control);
+    out += ",\"system\":"  + buildSystemJson(state, net);
+    out += ",\"limits\":"  + buildLimitsJson(control);
+    out += "}";
+    return out;
+}
+
+/// Befehl an die systemTask senden und auf das Ergebnis warten.
+/// Rückgabe: Ergebnistext; ok = ausgeführt oder gespeichert.
+String sendWebCommand(ControlCommand command, bool& ok)
+{
+    command.source = CommandSource::WebUi;
+    command.ticket = g_nextTicket.fetch_add(1);
+    ok = false;
+    if (xQueueSend(g_commandQueue, &command, pdMS_TO_TICKS(100)) != pdTRUE)
+    {
+        return "abgelehnt: Gerät ausgelastet, bitte erneut versuchen";
+    }
+    const uint32_t start = millis();
+    while (millis() - start < CommandWaitMs)
+    {
+        const ControlSnapshot c = readControl();
+        if (c.lastCommand.ticket == command.ticket)
+        {
+            if (command.kind == CommandKind::Override)
+            {
+                ok = true;
+                return "ausgeführt";
+            }
+            if (command.kind == CommandKind::ResetLimits && command.allRelays)
+            {
+                ok = true;
+                return "ausgeführt";
+            }
+            ok = c.lastResult == CommandResult::Accepted || c.lastResult == CommandResult::Deferred;
+            return LoadController::resultText(c.lastResult);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return "keine Rückmeldung (Befehl wird ggf. noch ausgeführt)";
+}
+
+String commandResponse(bool ok, const String& result)
+{
+    return "{\"ok\":" + String(ok ? "true" : "false") +
+           ",\"result\":" + WebUi::jsonString(result) +
+           ",\"live\":" + buildLiveJson() + "}";
+}
+
+/// Zusatz für /api/status (alle Reiter): Anzahl aktiver Fehler und Schwere,
+/// für die Markierung am Reiter "Fehler" und das Banner bei kritischen Fehlern.
+String buildStatusExtension()
+{
+    const SystemState s = readSystemState();
+    unsigned count = 0;
+    for (unsigned bit = 0; bit < SystemFault::BitCount; ++bit)
+    {
+        if (s.faults & (1u << bit)) ++count;
+    }
+    const char* severity = "none";
+    switch (s.severity)
+    {
+        case Severity::Info:     severity = "info";     break;
+        case Severity::Warning:  severity = "warning";  break;
+        case Severity::Critical: severity = "critical"; break;
+        default: break;
+    }
+    return "\"faults\":{\"count\":" + String(count) + ",\"severity\":\"" + severity + "\"}";
+}
+
+/******************************************************************************
+ * W4a Schritt 3: GET /api/device?role=shunt|mppt
+ *
+ * Alle empfangenen Felder des Geräts in Klartext (Name, formatierter Wert
+ * mit Einheit, Alter), dazu Gerät, UART und Verbindungsstatistik.
+ * Felder H1..H23 sind als "history" markiert (Reiter "Historie"), alle
+ * anderen erscheinen in den Reitern "Shunt"/"MPPT".
+ *
+ * Die Kopien liegen statisch (nur die webTask ruft das auf): DeviceState ist
+ * ca. 5 KB groß und gehört nicht auf den Stack.
+ ******************************************************************************/
+DeviceState g_webDeviceCopy;   ///< nur webTask
+LinkMonitor g_webLinkCopy;     ///< nur webTask
+
+/// VE.Direct-Historienfeld? (H1..H23, nicht z. B. "HSDS")
+bool isHistoryLabel(const char* label)
+{
+    return label[0] == 'H' && label[1] >= '0' && label[1] <= '9';
+}
+
+String buildDeviceJson(bool shunt)
+{
+    const SystemState state = readSystemState();
+    const int index = shunt ? state.batteryChannel : state.pvChannel;
+    if (index < 0 || index >= static_cast<int>(ChannelCount))
+    {
+        return "{\"present\":false}";
+    }
+    Channel& channel = g_channels[index];
+
+    {
+        StateLock lock(channel.stateMutex);
+        g_webDeviceCopy = channel.deviceState;
+        g_webLinkCopy   = channel.link;
+    }
+    const ChannelStatus status = readStatus(channel);
+    const uint32_t now = millis();   // erst NACH dem Kopieren lesen
+
+    const DeviceDetector::Identity& id = g_webDeviceCopy.identity();
+    String j;
+    j.reserve(4096);
+    j  = "{\"present\":true";
+    j += ",\"uart\":"   + WebUi::jsonString(channel.name);
+    j += ",\"device\":" + WebUi::jsonString(id.device ? id.device->name : "unbekanntes Gerät");
+    j += ",\"pid\":"    + WebUi::jsonString(id.productId);
+    j += ",\"lastFrameAgoMs\":" + String(status.hasValidFrame ? DeviceState::ageMs(status.lastValidFrameMs, now) : 0);
+
+    // Verbindung
+    const LinkMonitor::Counters& total = g_webLinkCopy.total();
+    j += ",\"link\":{";
+    j += "\"unstable\":"        + String(g_webLinkCopy.isUnstable() ? "true" : "false");
+    j += ",\"unstableCount\":"  + String(g_webLinkCopy.unstableCount());
+    j += ",\"checksumErrors\":" + String(total.checksumErrors);
+    j += ",\"discarded\":"      + String(total.discardedFrames);
+    j += ",\"outages\":"        + String(total.outages);
+    j += ",\"lastOutageMs\":"   + String(status.detector.lastOutageMs);
+    j += ",\"queueDrops\":"     + String(status.queueDrops);
+    j += "}";
+
+    // Felder in der Reihenfolge der fachlichen Bedeutung
+    j += ",\"fields\":[";
+    bool first = true;
+    char buffer[ValueFormatter::BufferSize];
+    for (size_t s = 0; s < DeviceState::SlotCount; ++s)
+    {
+        const DeviceState::Entry* e = g_webDeviceCopy.entry(static_cast<SemanticField>(s));
+        if (e == nullptr || !e->present)
+        {
+            continue;
+        }
+        const char* label = e->raw.label.data();
+        ValueFormatter::format(e->raw, e->value, buffer, sizeof(buffer));
+        if (!first) j += ",";
+        first = false;
+        j += "{\"label\":"  + WebUi::jsonString(label);
+        j += ",\"name\":"   + WebUi::jsonString(ValueFormatter::name(e->value));
+        j += ",\"value\":"  + WebUi::jsonString(buffer);
+        j += ",\"history\":" + String(isHistoryLabel(label) ? "true" : "false");
+        j += ",\"ageS\":"   + String(DeviceState::ageMs(e->updatedMs, now) / 1000);
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+/******************************************************************************
+ * W4a Schritt 4: GET /api/faults
+ *
+ * {"uptimeS":..,"reset":{"text":"..","severity":".."},
+ *  "active":[{"text":"..","severity":".."}],
+ *  "pvError":"..."|null, "batteryAlarm":"..."|null,
+ *  "events":[{"seq":..,"ageS":..,"severity":"..","text":".."}]}   (neueste zuerst)
+ ******************************************************************************/
+EventLog g_webEventsCopy;   ///< nur webTask (ca. 5 KB, nicht auf den Stack)
+
+const char* severityKey(Severity s)
+{
+    switch (s)
+    {
+        case Severity::Critical: return "critical";
+        case Severity::Warning:  return "warning";
+        case Severity::Info:     return "info";
+        default:                 return "none";
+    }
+}
+
+/// Ein Feld eines Kanals formatiert (z. B. Alarmgrund), "" wenn nicht vorhanden.
+String formatChannelField(int index, SemanticField field)
+{
+    if (index < 0 || index >= static_cast<int>(ChannelCount))
+    {
+        return "";
+    }
+    Channel& channel = g_channels[index];
+    {
+        StateLock lock(channel.stateMutex);
+        g_webDeviceCopy = channel.deviceState;
+    }
+    const DeviceState::Entry* e = g_webDeviceCopy.entry(field);
+    if (e == nullptr || !e->present)
+    {
+        return "";
+    }
+    char buffer[ValueFormatter::BufferSize];
+    ValueFormatter::format(e->raw, e->value, buffer, sizeof(buffer));
+    return String(buffer);
+}
+
+String buildFaultsJson()
+{
+    const SystemState state = readSystemState();
+    const SystemConfig cfg  = makeSystemConfig();
+
+    portENTER_CRITICAL(&g_eventLock);
+    g_webEventsCopy = g_events;
+    portEXIT_CRITICAL(&g_eventLock);
+    const uint32_t now = millis();
+
+    String j;
+    j.reserve(6000);
+    j = "{\"uptimeS\":" + String(now / 1000);
+
+    Severity resetSeverity = Severity::Info;
+    const char* resetText = resetReasonText(g_resetReason, resetSeverity);
+    j += ",\"reset\":{\"text\":" + WebUi::jsonString(resetText) +
+         ",\"severity\":\"" + severityKey(resetSeverity) + "\"}";
+
+    j += ",\"active\":[";
+    bool first = true;
+    for (unsigned bit = 0; bit < SystemFault::BitCount; ++bit)
+    {
+        const uint32_t mask = 1u << bit;
+        if ((state.faults & mask) == 0) continue;
+        if (!first) j += ",";
+        first = false;
+        j += "{\"text\":" + WebUi::jsonString(SystemEvaluator::faultText(mask)) +
+             ",\"severity\":\"" + severityKey(SystemEvaluator::severityOf(mask, cfg)) + "\"}";
+    }
+    j += "]";
+
+    // Meldungen der Geräte selbst (nur wenn ungleich "kein Fehler/Alarm")
+    const String pvError = state.pvErrorCode > 0 ? formatChannelField(state.pvChannel, SemanticField::ErrorCode) : String("");
+    const String alarm   = (state.faults & SystemFault::BatteryAlarm)
+                               ? formatChannelField(state.batteryChannel, SemanticField::AlarmReason) : String("");
+    j += ",\"pvError\":"      + (pvError.length() ? WebUi::jsonString(pvError) : String("null"));
+    j += ",\"batteryAlarm\":" + (alarm.length()   ? WebUi::jsonString(alarm)   : String("null"));
+
+    j += ",\"events\":[";
+    for (size_t i = 0; i < g_webEventsCopy.size(); ++i)
+    {
+        const EventLog::Entry& e = g_webEventsCopy.newest(i);
+        if (i > 0) j += ",";
+        j += "{\"seq\":"       + String(e.seq);
+        j += ",\"ageS\":"      + String(DeviceState::ageMs(e.timeMs, now) / 1000);
+        j += ",\"severity\":\"" + String(severityKey(e.severity)) + "\"";
+        j += ",\"text\":"      + WebUi::jsonString(e.text);
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+/******************************************************************************
+ * W4a Schritt 5: Einstellungen (Reiter "Einstellungen")
+ ******************************************************************************/
+/// Änderbare Werte als JSON-Felder (ohne Klammern).
+String limitsFields(const RelayLimits& l)
+{
+    String j;
+    j += "\"lock\":"     + String(l.lockBelowSoc, 1);
+    j += ",\"off\":"     + String(l.offBelowSoc, 1);
+    j += ",\"release\":" + String(l.releaseAtSoc, 1);
+    j += ",\"minOffS\":" + String(l.minOffTimeMs / 1000);
+    j += ",\"startup\":" + String(l.startupRequest ? "true" : "false");
+    j += ",\"auto\":"    + String(l.rememberRequest ? "true" : "false");
+    return j;
+}
+
+bool sameLimits(const RelayLimits& a, const RelayLimits& b)
+{
+    return socToTenths(a.lockBelowSoc) == socToTenths(b.lockBelowSoc) &&
+           socToTenths(a.offBelowSoc)  == socToTenths(b.offBelowSoc)  &&
+           socToTenths(a.releaseAtSoc) == socToTenths(b.releaseAtSoc) &&
+           a.minOffTimeMs / 1000 == b.minOffTimeMs / 1000 &&
+           a.startupRequest == b.startupRequest && a.rememberRequest == b.rememberRequest;
+}
+
+/// GET /api/settings: Anlage + je Relais aktuelle Werte und Voreinstellung.
+String buildSettingsJson()
+{
+    const ControlSnapshot      control = readControl();
+    const LoadControllerConfig preset  = presetConfig();
+    String j;
+    j.reserve(1200);
+    j  = "{\"installation\":\"";
+    j += g_config.installation.load() == Installation::Balcony ? "balcony" : "camper";
+    j += "\",\"maxMinOffS\":" + String(RelayLimits::MaxMinOffTimeMs / 1000);
+    j += ",\"relays\":[";
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        const RelayConfig& r   = control.configs[i];
+        const RelayLimits  cur = RelayLimits::from(r);
+        const RelayLimits  def = RelayLimits::from(preset.relays[i]);
+        if (i > 0) j += ",";
+        j += "{\"name\":"         + WebUi::jsonString(r.name);
+        j += ",\"enabled\":"      + String(r.enabled ? "true" : "false");
+        j += ",\"requiresSoc\":"  + String(r.requiresSoc ? "true" : "false");
+        j += ",\"forceOffWithoutSoc\":" + String(r.forceOffWithoutSoc ? "true" : "false");
+        j += ",\"custom\":"       + String(sameLimits(cur, def) ? "false" : "true");
+        j += "," + limitsFields(cur);
+        j += ",\"preset\":{" + limitsFields(def) + "}}";
+    }
+    j += "]}";
+    return j;
+}
+
+/// Zahl aus einem Formularfeld (Dezimalkomma erlaubt). false = keine Zahl.
+bool parseNumber(String text, float& out)
+{
+    text.trim();
+    text.replace(',', '.');
+    if (text.length() == 0 || text.length() > 8)
+    {
+        return false;
+    }
+    int dots = 0;
+    for (size_t i = 0; i < text.length(); ++i)
+    {
+        const char c = text[i];
+        if (c == '.') { if (++dots > 1) return false; }
+        else if (c < '0' || c > '9') return false;
+    }
+    out = text.toFloat();
+    return true;
+}
+
+String settingsResponse(bool ok, const String& result)
+{
+    return "{\"ok\":" + String(ok ? "true" : "false") +
+           ",\"result\":" + WebUi::jsonString(result) +
+           ",\"settings\":" + buildSettingsJson() + "}";
+}
+
+/// POST /api/settings/relay: relay=1..3, lock, off, release (%), minOffS (s),
+/// startup=ON/OFF, auto=ON/OFF.
+int handleRelaySettings(const ApiRequest& req, String& out)
+{
+    const long relay = req.arg("relay").toInt();
+    if (relay < 1 || relay > static_cast<long>(RelayCount))
+    {
+        out = "{\"ok\":false,\"error\":\"relay muss 1..3 sein\"}";
+        return 400;
+    }
+    float lock = 0, off = 0, release = 0, minOff = 0;
+    const int startup = parseOnOff(req.arg("startup"));
+    const int autoOn  = parseOnOff(req.arg("auto"));
+    if (!parseNumber(req.arg("lock"), lock) || !parseNumber(req.arg("off"), off) ||
+        !parseNumber(req.arg("release"), release) || !parseNumber(req.arg("minOffS"), minOff) ||
+        startup < 0 || autoOn < 0)
+    {
+        out = "{\"ok\":false,\"error\":\"Bitte alle Felder mit gültigen Zahlen ausfüllen\"}";
+        return 400;
+    }
+
+    RelayLimits l;
+    l.lockBelowSoc    = socToTenths(lock) / 10.0f;   // auf 0,1 % runden (wie gespeichert)
+    l.offBelowSoc     = socToTenths(off) / 10.0f;
+    l.releaseAtSoc    = socToTenths(release) / 10.0f;
+    l.minOffTimeMs    = (minOff > RelayLimits::MaxMinOffTimeMs / 1000.0f)
+                            ? RelayLimits::MaxMinOffTimeMs + 1000   // -> validate() lehnt ab
+                            : static_cast<uint32_t>(minOff + 0.5f) * 1000;
+    l.startupRequest  = startup == 1;
+    l.rememberRequest = autoOn == 1;
+
+    const char* error = l.validate();
+    if (error != nullptr)
+    {
+        out = "{\"ok\":false,\"error\":" + WebUi::jsonString(error) + "}";
+        return 400;
+    }
+
+    ControlCommand command;
+    command.kind   = CommandKind::Limits;
+    command.relay  = static_cast<RelayId>(relay - 1);
+    command.limits = l;
+    bool ok = false;
+    String result = sendWebCommand(command, ok);
+    if (ok && !saveRelayLimits(static_cast<size_t>(relay - 1), l))
+    {
+        ok = false;
+        result = "übernommen, aber Speichern im Flash fehlgeschlagen (gilt bis zum Neustart)";
+    }
+    else if (ok)
+    {
+        result = "gespeichert";
+    }
+    out = settingsResponse(ok, result);
+    return 200;
+}
+
+void registerProjectApi()
+{
+    g_webUi.setStatusExtension(buildStatusExtension);
+
+    g_webUi.addApi("/api/faults", WebUi::Method::Get,
+                   [](const ApiRequest&, String& out) {
+                       out = buildFaultsJson();
+                       return 200;
+                   });
+
+    g_webUi.addApi("/api/device", WebUi::Method::Get,
+                   [](const ApiRequest& req, String& out) {
+                       const String role = req.arg("role");
+                       if (role != "shunt" && role != "mppt")
+                       {
+                           out = "{\"ok\":false,\"error\":\"role muss shunt oder mppt sein\"}";
+                           return 400;
+                       }
+                       out = buildDeviceJson(role == "shunt");
+                       return 200;
+                   });
+
+    g_webUi.addApi("/api/live", WebUi::Method::Get,
+                   [](const ApiRequest&, String& out) {
+                       out = buildLiveJson();
+                       return 200;
+                   });
+
+    g_webUi.addApi("/api/relay", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       const long relay = req.arg("relay").toInt();
+                       const int  value = parseOnOff(req.arg("on"));
+                       if (relay < 1 || relay > static_cast<long>(RelayCount) || value < 0)
+                       {
+                           out = "{\"ok\":false,\"error\":\"relay muss 1..3 und on ON/OFF sein\"}";
+                           return 400;
+                       }
+                       ControlCommand command;
+                       command.kind  = CommandKind::Relay;
+                       command.relay = static_cast<RelayId>(relay - 1);
+                       command.on    = value == 1;
+                       bool ok = false;
+                       const String result = sendWebCommand(command, ok);
+                       out = commandResponse(ok, result);
+                       return 200;
+                   });
+
+    g_webUi.addApi("/api/override", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       const int value = parseOnOff(req.arg("on"));
+                       if (value < 0)
+                       {
+                           out = "{\"ok\":false,\"error\":\"on muss ON oder OFF sein\"}";
+                           return 400;
+                       }
+                       ControlCommand command;
+                       command.kind = CommandKind::Override;
+                       command.on   = value == 1;
+                       bool ok = false;
+                       const String result = sendWebCommand(command, ok);
+                       out = commandResponse(ok, result);
+                       return 200;
+                   });
+
+    // ---- W4a Schritt 5: Einstellungen ----
+    g_webUi.addApi("/api/settings", WebUi::Method::Get,
+                   [](const ApiRequest&, String& out) {
+                       out = buildSettingsJson();
+                       return 200;
+                   });
+
+    g_webUi.addApi("/api/settings/relay", WebUi::Method::Post, handleRelaySettings);
+
+    // Relais auf die Voreinstellung der Anlage (ohne Neustart).
+    // Ohne Parameter alle Relais, mit relay=1..3 nur dieses eine.
+    g_webUi.addApi("/api/settings/defaults", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       ControlCommand command;
+                       command.kind = CommandKind::ResetLimits;
+                       if (req.hasArg("relay"))
+                       {
+                           const long relay = req.arg("relay").toInt();
+                           if (relay < 1 || relay > static_cast<long>(RelayCount))
+                           {
+                               out = "{\"ok\":false,\"error\":\"relay muss 1..3 sein\"}";
+                               return 400;
+                           }
+                           command.allRelays = false;
+                           command.relay     = static_cast<RelayId>(relay - 1);
+                       }
+                       bool ok = false;
+                       String result = sendWebCommand(command, ok);
+                       if (ok && command.allRelays)
+                       {
+                           SettingsStore::clear(NvsRelays);
+                           result = "Voreinstellung wiederhergestellt";
+                       }
+                       else if (ok)
+                       {
+                           // Nur die Schlüssel dieses Relais löschen -> beim Start Voreinstellung
+                           const size_t i = static_cast<size_t>(command.relay);
+                           const char* keys[] = { "set", "lock", "off", "rel", "minoff", "start", "auto" };
+                           for (const char* k : keys)
+                           {
+                               SettingsStore::remove(NvsRelays, relayKey(i, k).c_str());
+                           }
+                           result = "Voreinstellung wiederhergestellt";
+                       }
+                       out = settingsResponse(ok, result);
+                       return 200;
+                   });
+
+    // Anlage wechseln: speichern, Relais-Änderungen löschen, Neustart
+    g_webUi.addApi("/api/settings/installation", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       const String value = req.arg("value");
+                       if (value != "camper" && value != "balcony")
+                       {
+                           out = "{\"ok\":false,\"error\":\"value muss camper oder balcony sein\"}";
+                           return 400;
+                       }
+                       const bool balcony = value == "balcony";
+                       if (balcony == (g_config.installation.load() == Installation::Balcony))
+                       {
+                           out = "{\"ok\":true,\"restart\":false,\"result\":\"unverändert\"}";
+                           return 200;
+                       }
+                       if (!SettingsStore::putUInt(NvsApp, "install", balcony ? 1 : 0))
+                       {
+                           out = "{\"ok\":false,\"error\":\"Speichern im Flash fehlgeschlagen\"}";
+                           return 500;
+                       }
+                       SettingsStore::clear(NvsRelays);
+                       addEvent(Severity::Warning, "Anlage geändert auf %s, Neustart (Befehl WebUI)",
+                                balcony ? "Balkonkraftwerk" : "Camper");
+                       g_webUi.requestRestart(1500);
+                       out = "{\"ok\":true,\"restart\":true,\"result\":\"gespeichert, Gerät startet neu\"}";
+                       return 200;
+                   });
 }
 
 /// "ON"/"OFF", "1"/"0", "true"/"false" (Groß/klein egal). -1 = ungültig.
@@ -1797,6 +2761,25 @@ void setup()
     // W2: Probestart nach Update prüfen. Lief die neue Firmware zu oft nicht
     // stabil, wird hier auf die vorherige zurückgeschaltet (Neustart).
     UpdateManager::checkTrialBoot();
+
+    // W4a Schritt 5: gewählte Anlage (Camper/Balkonkraftwerk) aus dem NVS,
+    // bevor die systemTask die Relais-Voreinstellung lädt
+    loadInstallation();
+
+    // W4a: Grund des Neustarts als erstes Ereignis (Absturz, Watchdog,
+    // Brownout = kritisch)
+    {
+        g_resetReason = esp_reset_reason();
+        Severity severity = Severity::Info;
+        const char* reason = resetReasonText(g_resetReason, severity);
+        addEvent(severity, "Gerät gestartet: %s (Firmware %s)", reason, FirmwareVersion);
+        Serial.printf("Neustart-Grund: %s\n", reason);
+        if (UpdateManager::rolledBack())
+        {
+            addEvent(Severity::Warning, "Neue Firmware lief nicht stabil, vorherige Firmware wiederhergestellt");
+        }
+    }
+
     if (UpdateManager::onTrial())
     {
         Serial.printf("[UPDATE] Neue Firmware läuft auf Probe: Start %lu von %u "

@@ -86,8 +86,74 @@ LoadControllerConfig LoadControllerConfig::balcony()
 }
 
 /******************************************************************************
+ * RelayLimits (W4a Schritt 5)
+ ******************************************************************************/
+RelayLimits RelayLimits::from(const RelayConfig& config)
+{
+    RelayLimits l;
+    l.lockBelowSoc    = config.lockBelowSoc;
+    l.offBelowSoc     = config.offBelowSoc;
+    l.releaseAtSoc    = config.releaseAtSoc;
+    l.minOffTimeMs    = config.minOffTimeMs;
+    l.startupRequest  = config.startupRequest;
+    l.rememberRequest = config.rememberRequest;
+    return l;
+}
+
+void RelayLimits::applyTo(RelayConfig& config) const
+{
+    config.lockBelowSoc    = lockBelowSoc;
+    config.offBelowSoc     = offBelowSoc;
+    config.releaseAtSoc    = releaseAtSoc;
+    config.minOffTimeMs    = minOffTimeMs;
+    config.startupRequest  = startupRequest;
+    config.rememberRequest = rememberRequest;
+}
+
+const char* RelayLimits::validate() const
+{
+    // "!(x >= 0 && x <= 100)" erkennt auch NaN (Vergleiche mit NaN sind falsch)
+    if (!(offBelowSoc  >= 0.0f && offBelowSoc  <= 100.0f) ||
+        !(lockBelowSoc >= 0.0f && lockBelowSoc <= 100.0f) ||
+        !(releaseAtSoc >= 0.0f && releaseAtSoc <= 100.0f))
+    {
+        return "SOC-Werte müssen zwischen 0 und 100 % liegen";
+    }
+    // Aus > Sperre wäre widersinnig: Einschalten erlaubt, aber sofort wieder aus
+    if (offBelowSoc > lockBelowSoc)
+    {
+        return "\"Aus unter\" darf nicht größer als \"Sperre unter\" sein";
+    }
+    // Frei < Sperre: Die Sperre würde sofort wieder aufgehoben (keine Hysterese)
+    if (releaseAtSoc < lockBelowSoc)
+    {
+        return "\"Frei ab\" darf nicht kleiner als \"Sperre unter\" sein";
+    }
+    if (minOffTimeMs > MaxMinOffTimeMs)
+    {
+        return "Mindest-Auszeit höchstens 3600 s";
+    }
+    return nullptr;
+}
+
+/******************************************************************************
  * LoadController
  ******************************************************************************/
+CommandResult LoadController::setLimits(RelayId relay, const RelayLimits& limits)
+{
+    const std::size_t index = static_cast<std::size_t>(relay);
+    if (index >= RelayCount || !m_config.relays[index].enabled)
+    {
+        return CommandResult::RejectedDisabled;
+    }
+    if (limits.validate() != nullptr)
+    {
+        return CommandResult::RejectedInvalid;
+    }
+    limits.applyTo(m_config.relays[index]);
+    return CommandResult::Accepted;
+}
+
 LoadController::LoadController(const LoadControllerConfig& config)
     : m_config(config)
 {
@@ -304,6 +370,7 @@ const char* LoadController::resultText(CommandResult result)
         case CommandResult::RejectedLocked:   return "abgelehnt: SOC zu niedrig oder kein gültiger SOC";
         case CommandResult::RejectedSource:   return "abgelehnt: Befehlsquelle nicht erlaubt";
         case CommandResult::RejectedDisabled: return "abgelehnt: Relais deaktiviert";
+        case CommandResult::RejectedInvalid:  return "abgelehnt: ungültige Werte";
     }
     return "?";
 }

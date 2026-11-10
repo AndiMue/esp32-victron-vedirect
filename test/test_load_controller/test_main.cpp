@@ -362,6 +362,114 @@ void test_result_texts_defined()
 }
 
 /******************************************************************************
+ * W4a Schritt 5: änderbare Werte (RelayLimits)
+ ******************************************************************************/
+void test_limits_presets_are_valid()
+{
+    const LoadControllerConfig presets[] = { LoadControllerConfig::camper(),
+                                             LoadControllerConfig::balcony() };
+    for (const LoadControllerConfig& p : presets)
+    {
+        for (std::size_t i = 0; i < RelayCount; ++i)
+        {
+            TEST_ASSERT_NULL(RelayLimits::from(p.relays[i]).validate());
+        }
+    }
+}
+
+void test_limits_roundtrip()
+{
+    RelayConfig cfg = LoadControllerConfig::camper().relays[0];
+    RelayLimits l   = RelayLimits::from(cfg);
+    l.lockBelowSoc    = 40.0f;
+    l.offBelowSoc     = 20.0f;
+    l.releaseAtSoc    = 50.0f;
+    l.minOffTimeMs    = 120000;
+    l.startupRequest  = true;
+    l.rememberRequest = true;
+    l.applyTo(cfg);
+
+    TEST_ASSERT_EQUAL_FLOAT(40.0f, cfg.lockBelowSoc);
+    TEST_ASSERT_EQUAL_FLOAT(20.0f, cfg.offBelowSoc);
+    TEST_ASSERT_EQUAL_FLOAT(50.0f, cfg.releaseAtSoc);
+    TEST_ASSERT_EQUAL_UINT32(120000, cfg.minOffTimeMs);
+    TEST_ASSERT_TRUE(cfg.startupRequest);
+    TEST_ASSERT_TRUE(cfg.rememberRequest);
+    // Nicht änderbare Werte bleiben
+    TEST_ASSERT_TRUE(cfg.requiresSoc);
+    TEST_ASSERT_TRUE(cfg.forceOffWithoutSoc);
+    TEST_ASSERT_EQUAL_STRING("Wechselrichter", cfg.name);
+}
+
+void test_limits_validation_rejects_bad_values()
+{
+    RelayLimits ok;
+    ok.offBelowSoc = 10.0f; ok.lockBelowSoc = 20.0f; ok.releaseAtSoc = 30.0f;
+    TEST_ASSERT_NULL(ok.validate());
+
+    RelayLimits l = ok;  l.offBelowSoc = 25.0f;           // Aus > Sperre
+    TEST_ASSERT_NOT_NULL(l.validate());
+    l = ok;  l.releaseAtSoc = 15.0f;                       // Frei < Sperre
+    TEST_ASSERT_NOT_NULL(l.validate());
+    l = ok;  l.releaseAtSoc = 100.5f;                      // > 100 %
+    TEST_ASSERT_NOT_NULL(l.validate());
+    l = ok;  l.offBelowSoc = -1.0f;                        // < 0 %
+    TEST_ASSERT_NOT_NULL(l.validate());
+    l = ok;  l.lockBelowSoc = 0.0f / 0.0f;                 // NaN
+    TEST_ASSERT_NOT_NULL(l.validate());
+    l = ok;  l.minOffTimeMs = RelayLimits::MaxMinOffTimeMs + 1;
+    TEST_ASSERT_NOT_NULL(l.validate());
+
+    // Grenzfälle erlaubt: alle gleich, 0 und 100
+    l = ok;  l.offBelowSoc = l.lockBelowSoc = l.releaseAtSoc = 0.0f;
+    TEST_ASSERT_NULL(l.validate());
+    l = ok;  l.releaseAtSoc = 100.0f; l.minOffTimeMs = RelayLimits::MaxMinOffTimeMs;
+    TEST_ASSERT_NULL(l.validate());
+}
+
+void test_set_limits_rejected_for_disabled_or_invalid()
+{
+    g_ctl.setConfig(LoadControllerConfig::balcony());
+    g_ctl.start(0);
+    RelayLimits l = RelayLimits::from(g_ctl.config().relays[1]);
+    TEST_ASSERT_EQUAL(CommandResult::RejectedDisabled, g_ctl.setLimits(RelayId::Light, l));
+
+    RelayLimits bad = RelayLimits::from(g_ctl.config().relays[0]);
+    bad.offBelowSoc = 99.0f;
+    TEST_ASSERT_EQUAL(CommandResult::RejectedInvalid, g_ctl.setLimits(RelayId::Main, bad));
+    TEST_ASSERT_EQUAL_FLOAT(15.0f, g_ctl.config().relays[0].offBelowSoc);   // unverändert
+}
+
+void test_set_limits_takes_effect_on_next_update()
+{
+    // Licht läuft bei 40 %; neue Schwelle "aus unter 50 %" -> beim nächsten Update aus
+    g_ctl.update(withSoc(40.0f), 1000);
+    TEST_ASSERT_TRUE(isOn(RelayId::Light));
+
+    RelayLimits l = RelayLimits::from(g_ctl.config().relays[1]);
+    l.offBelowSoc = 50.0f; l.lockBelowSoc = 50.0f; l.releaseAtSoc = 60.0f;
+    TEST_ASSERT_EQUAL(CommandResult::Accepted, g_ctl.setLimits(RelayId::Light, l));
+    TEST_ASSERT_TRUE(isOn(RelayId::Light));          // setLimits selbst schaltet nicht
+    TEST_ASSERT_TRUE(g_ctl.status(RelayId::Light).requested);
+
+    g_ctl.update(withSoc(40.0f), 2000);
+    TEST_ASSERT_FALSE(isOn(RelayId::Light));
+    TEST_ASSERT_TRUE(g_ctl.status(RelayId::Light).requested);   // remember: Wunsch bleibt
+}
+
+void test_set_limits_startup_request_used_after_restart()
+{
+    RelayLimits l = RelayLimits::from(g_ctl.config().relays[0]);
+    l.startupRequest = true;
+    TEST_ASSERT_EQUAL(CommandResult::Accepted, g_ctl.setLimits(RelayId::Main, l));
+    g_ctl.start(0);
+    TEST_ASSERT_TRUE(g_ctl.status(RelayId::Main).requested);
+    TEST_ASSERT_FALSE(isOn(RelayId::Main));           // wartet auf gültigen SOC
+    g_ctl.update(withSoc(80.0f), 1000);
+    TEST_ASSERT_TRUE(isOn(RelayId::Main));
+}
+
+/******************************************************************************
  * Testlauf
  ******************************************************************************/
 int runAllTests()
@@ -391,6 +499,12 @@ int runAllTests()
     RUN_TEST(test_balcony_remembers_request);
     RUN_TEST(test_balcony_deferred_request);
     RUN_TEST(test_result_texts_defined);
+    RUN_TEST(test_limits_presets_are_valid);
+    RUN_TEST(test_limits_roundtrip);
+    RUN_TEST(test_limits_validation_rejects_bad_values);
+    RUN_TEST(test_set_limits_rejected_for_disabled_or_invalid);
+    RUN_TEST(test_set_limits_takes_effect_on_next_update);
+    RUN_TEST(test_set_limits_startup_request_used_after_restart);
     return UNITY_END();
 }
 

@@ -346,8 +346,7 @@ void WebUi::handleRestart()
 {
     if (!authorize()) return;
     sendJson(200, "{\"ok\":true}");
-    m_restartPending = true;
-    m_restartAtMs = millis() + 1000;   // Antwort noch ausliefern
+    requestRestart(1000);   // Antwort noch ausliefern
 }
 
 /******************************************************************************
@@ -521,6 +520,24 @@ void WebUi::handleMqttReset()
 }
 
 /******************************************************************************
+ * Projekt-Endpunkte (W4a)
+ ******************************************************************************/
+String ApiRequest::arg(const char* name) const
+{
+    return g_server.arg(name);
+}
+
+bool ApiRequest::hasArg(const char* name) const
+{
+    return g_server.hasArg(name);
+}
+
+void WebUi::addApi(const char* path, Method method, ApiHandler handler)
+{
+    m_projectApis.push_back({String(path), method, handler});
+}
+
+/******************************************************************************
  * Start / Schleife
  ******************************************************************************/
 void WebUi::begin(WifiManager& wifi, const char* deviceName, const char* firmwareVersion)
@@ -544,6 +561,22 @@ void WebUi::begin(WifiManager& wifi, const char* deviceName, const char* firmwar
         g_server.on("/api/mqtt",       HTTP_POST, [this]() { handleMqttPost(); });
         g_server.on("/api/mqtt/test",  HTTP_POST, [this]() { handleMqttTest(); });
         g_server.on("/api/mqtt/reset", HTTP_POST, [this]() { handleMqttReset(); });
+    }
+
+    // W4a: Projekt-Endpunkte. Login wird hier geprüft, der Handler liefert
+    // nur Statuscode und JSON. Die Einträge in m_projectApis bleiben bis
+    // zum Neustart bestehen (Lambda hält nur den Index).
+    for (size_t i = 0; i < m_projectApis.size(); ++i)
+    {
+        const ProjectApi& api = m_projectApis[i];
+        g_server.on(api.path.c_str(), api.method == Method::Post ? HTTP_POST : HTTP_GET,
+                    [this, i]() {
+                        if (!authorize()) return;
+                        ApiRequest request;
+                        String body;
+                        const int code = m_projectApis[i].handler(request, body);
+                        sendJson(code, body.length() ? body : String("{}"));
+                    });
     }
 
     // W2: Updates (erster Handler = Antwort, zweiter = Datenstücke)

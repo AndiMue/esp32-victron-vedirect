@@ -1,5 +1,6 @@
 <!DOCTYPE html>
-<!-- VE.Direct WebUI, Stufe W1 (Status, WLAN, Gerät). Keine externen Quellen. -->
+<!-- VE.Direct WebUI. Stufe W4a: Projekt-Reiter + Sammelreiter "System"
+     (Info, WLAN, MQTT, Gerät, Update). Keine externen Quellen. -->
 <html lang="de">
 <head>
   <meta charset="utf-8">
@@ -10,192 +11,362 @@
 <body>
   <header>
     <h1 id="deviceName">VE.Direct</h1>
-    <nav>
-      <button class="tab active" data-tab="status">Status</button>
-      <button class="tab" data-tab="wifi">WLAN</button>
-      <button class="tab" data-tab="mqtt">MQTT</button>
-      <button class="tab" data-tab="device">Gerät</button>
-      <button class="tab" data-tab="update">Update</button>
+    <!-- Hauptreiter; auf dem Handy waagerecht wischbar -->
+    <nav class="tabs">
+      <button class="tab" data-tab="overview">Übersicht</button>
+      <button class="tab" data-tab="shunt">Shunt</button>
+      <button class="tab" data-tab="mppt">MPPT</button>
+      <button class="tab" data-tab="history">Historie</button>
+      <button class="tab" data-tab="faults">Fehler <span id="faultBadge" class="badge hidden">0</span></button>
+      <button class="tab" data-tab="settings">Einstellungen</button>
+      <button class="tab" data-tab="system">System</button>
     </nav>
   </header>
 
   <main>
+    <div id="critBanner" class="banner danger hidden">
+      <b>Kritischer Fehler.</b> Details im Reiter <a href="#" id="critLink">Fehler</a>.
+    </div>
     <div id="pwWarning" class="banner warn hidden">
-      Das Gerätepasswort ist noch das Startpasswort. Bitte unter <b>Gerät</b> ändern.
+      Das Gerätepasswort ist noch das Startpasswort. Bitte unter <b>System → Gerät</b> ändern.
     </div>
 
-    <!-- ===================== Status ===================== -->
-    <section id="tab-status" class="panel">
-      <h2>Netzwerk</h2>
-      <dl class="grid">
-        <dt>Zustand</dt>        <dd id="stState">–</dd>
-        <dt>Letzter Fehler</dt> <dd id="stError">–</dd>
-        <dt>WLAN</dt>           <dd id="stSsid">–</dd>
-        <dt>IP-Adresse</dt>     <dd id="stIp">–</dd>
-        <dt>Signal</dt>         <dd id="stRssi">–</dd>
-        <dt>Access Point</dt>   <dd id="stAp">–</dd>
-        <dt>Adresse</dt>        <dd id="stHost">–</dd>
-        <dt>MQTT</dt>           <dd id="stMqtt">–</dd>
-      </dl>
-      <h2>Gerät</h2>
-      <dl class="grid">
-        <dt>Firmware</dt>       <dd id="stFw">–</dd>
-        <dt>WebUI</dt>          <dd id="stWebui">–</dd>
-        <dt>Laufzeit</dt>       <dd id="stUptime">–</dd>
-        <dt>Freier Speicher</dt><dd id="stHeap">–</dd>
-      </dl>
-    </section>
+    <!-- ===================== Übersicht ===================== -->
+    <section id="tab-overview" class="panel hidden">
+      <div id="ovOverrideBanner" class="banner danger hidden">
+        <b>Override aktiv:</b> Alle Schutzsperren sind aufgehoben. Nur noch das BMS schützt den Akku.
+      </div>
 
-    <!-- ===================== WLAN ===================== -->
-    <section id="tab-wifi" class="panel hidden">
-      <h2>WLAN verbinden</h2>
-      <form id="wifiForm">
-        <label>Netzwerk (SSID)
-          <input id="wifiSsid" name="ssid" maxlength="32" required list="ssidList" autocomplete="off">
-          <datalist id="ssidList"></datalist>
-        </label>
-        <button type="button" id="scanBtn" class="secondary">Netzwerke suchen</button>
-        <ul id="scanList" class="scanlist"></ul>
-
-        <label>Passwort
-          <input id="wifiPass" name="password" type="password" maxlength="63" autocomplete="new-password">
-          <small id="wifiPassHint">Leer lassen = bisheriges Passwort behalten.</small>
-        </label>
-        <label class="check small"><input type="checkbox" data-show="wifiPass"> Passwort anzeigen</label>
-
-        <label class="check">
-          <input id="apAlways" name="apAlways" type="checkbox">
-          Access Point immer eingeschaltet lassen (z. B. Camper ohne Router)
-        </label>
-
-        <button type="submit">Speichern und verbinden</button>
-      </form>
-
-      <h2>WLAN zurücksetzen</h2>
-      <p>Löscht die WLAN-Zugangsdaten. Das Gerät ist danach nur noch über seinen Access Point erreichbar.</p>
-      <button id="wifiResetBtn" class="danger">WLAN-Zugangsdaten löschen</button>
-    </section>
-
-    <!-- ===================== MQTT ===================== -->
-    <section id="tab-mqtt" class="panel hidden">
-      <dl class="grid">
-        <dt>Zustand</dt>       <dd id="mqState">–</dd>
-        <dt>Letzter Fehler</dt><dd id="mqError">–</dd>
-        <dt>Gesendet</dt>      <dd id="mqCounts">–</dd>
-      </dl>
-
-      <hr>
-      <h2>Einstellungen</h2>
-      <form id="mqttForm">
-        <label class="check">
-          <input id="mqEnabled" type="checkbox"> MQTT einschalten
-        </label>
-        <label>Broker (Hostname oder IP-Adresse)
-          <input id="mqHost" maxlength="64" placeholder="z. B. 192.168.178.20">
-        </label>
-        <label>Port
-          <input id="mqPort" type="number" min="1" max="65535" value="1883">
-        </label>
-        <label>Benutzer
-          <input id="mqUser" maxlength="64" autocomplete="off">
-          <small>Leer lassen = ohne Anmeldung.</small>
-        </label>
-        <label>Passwort
-          <input id="mqPass" type="password" maxlength="64" autocomplete="new-password">
-          <small id="mqPassHint">Leer lassen = bisheriges Passwort behalten.</small>
-        </label>
-        <label class="check small"><input type="checkbox" data-show="mqPass"> Passwort anzeigen</label>
-        <label>Basis-Topic
-          <input id="mqBase" maxlength="64" value="vedirect">
-        </label>
-        <label>Sendeintervall in Sekunden (1–3600)
-          <input id="mqInterval" type="number" min="1" max="3600" value="10">
-        </label>
-        <label>Client-ID
-          <input id="mqClient" maxlength="64" autocomplete="off">
-          <small>Leer lassen = automatisch (ve-direct-…).</small>
-        </label>
-        <button type="submit">Speichern und verbinden</button>
-        <button type="button" id="mqTestBtn" class="secondary">Verbindung testen</button>
-      </form>
-
-      <hr>
-      <h2>Topics</h2>
-      <p class="hint" style="margin-top:0">Senden (JSON, retained): <code id="tpBase1">vedirect</code>/status, /battery, /pv, /relays, /system.<br>
-        Befehle (ON/OFF): /relay/r1-set, /relay/r2-set, /relay/r3-set, /override-set. Rückmeldung: /command-result.</p>
-
-      <hr>
-      <h2>MQTT zurücksetzen</h2>
-      <button id="mqResetBtn" class="danger">MQTT-Einstellungen löschen</button>
-    </section>
-
-    <!-- ===================== Gerät ===================== -->
-    <section id="tab-device" class="panel hidden">
-      <h2>Gerätepasswort ändern</h2>
-      <p>Gilt für den Access Point (WLAN-Passwort) <b>und</b> die Anmeldung an dieser Seite (Benutzer <code>admin</code>).</p>
-      <form id="pwForm">
-        <label>Aktuelles Passwort
-          <input id="pwCurrent" type="password" required autocomplete="current-password">
-        </label>
-        <label>Neues Passwort (8–63 Zeichen)
-          <input id="pwNew" type="password" minlength="8" maxlength="63" required autocomplete="new-password">
-        </label>
-        <label>Neues Passwort wiederholen
-          <input id="pwNew2" type="password" minlength="8" maxlength="63" required autocomplete="new-password">
-        </label>
-        <label class="check small"><input type="checkbox" data-show="pwCurrent,pwNew,pwNew2"> Passwörter anzeigen</label>
-        <button type="submit">Passwort ändern</button>
-      </form>
-
-      <h2>Neustart</h2>
-      <button id="restartBtn" class="secondary">Gerät neu starten</button>
-    </section>
-
-    <!-- ===================== Update ===================== -->
-    <section id="tab-update" class="panel hidden">
-      <div id="rollbackWarning" class="banner warn hidden">
-        Die zuletzt aufgespielte Firmware lief nicht stabil. Es wurde automatisch auf die vorherige Firmware zurückgeschaltet.
+      <!-- Batterie -->
+      <h2>Batterie</h2>
+      <div class="bigline">
+        <span id="ovSoc" class="big">–</span>
+        <span id="ovDir" class="dir"></span>
       </div>
       <dl class="grid">
-        <dt>Firmware</dt> <dd id="upFw">–</dd>
-        <dt>WebUI</dt>    <dd id="upWebui">–</dd>
-        <dt>Zustand</dt>  <dd id="upTrial">–</dd>
+        <dt>Spannung</dt>       <dd id="ovVoltage">–</dd>
+        <dt>Strom</dt>          <dd id="ovCurrent">–</dd>
+        <dt>Leistung</dt>       <dd id="ovPower">–</dd>
+        <dt>Restlaufzeit</dt>   <dd id="ovTtg">–</dd>
+        <dt>Verbraucht</dt>     <dd id="ovConsumed">–</dd>
+      </dl>
+      <p id="ovVoltHint" class="hint hidden">* Spannung vom MPPT gemessen, weil der SmartShunt fehlt. SOC und Strom sind ohne Shunt nicht verfügbar.</p>
+
+      <!-- Solar -->
+      <hr>
+      <h2>Solar</h2>
+      <dl class="grid">
+        <dt>PV-Leistung</dt>    <dd id="ovPvPower">–</dd>
+        <dt>PV-Spannung</dt>    <dd id="ovPvVoltage">–</dd>
+        <dt>Ladezustand</dt>    <dd id="ovPvState">–</dd>
+        <dt>Ertrag heute</dt>   <dd id="ovPvYield">–</dd>
+        <dt>MPPT-Fehler</dt>    <dd id="ovPvError">–</dd>
       </dl>
 
-      <p>Die Dateien erzeugt der Build automatisch im Ordner <code>.pio/build/esp32dev/</code>.</p>
+      <!-- Relais -->
+      <hr>
+      <h2>Verbraucher</h2>
+      <div id="ovRelays"></div>
+
+      <div class="relay override">
+        <div class="relay-head">
+          <span class="relay-name">Override</span>
+          <span id="ovOverrideState" class="pill">–</span>
+          <span class="relay-buttons">
+            <button class="small" id="ovOverrideOn">Ein</button>
+            <button class="small secondary" id="ovOverrideOff">Aus</button>
+          </span>
+        </div>
+        <div class="relay-info">Hebt alle Sperren auf (SOC-Schwellen, fehlender Shunt). Endet mit dem Neustart.</div>
+      </div>
+
+      <!-- Verbindung -->
+      <hr>
+      <h2>Verbindung</h2>
+      <dl class="grid">
+        <dt>SmartShunt</dt>     <dd id="ovLinkShunt">–</dd>
+        <dt>MPPT</dt>           <dd id="ovLinkMppt">–</dd>
+      </dl>
+      <p id="ovUpdated" class="hint">–</p>
+    </section>
+
+    <!-- ===================== Shunt ===================== -->
+    <!-- Shunt und MPPT: gleicher Aufbau, gefüllt von renderDevice() -->
+    <section id="tab-shunt" class="panel hidden">
+      <h2>Batteriemonitor (SmartShunt)</h2>
+      <div id="shuntMissing" class="banner danger hidden">Kein SmartShunt erkannt (nicht angeschlossen oder ausgefallen).</div>
+      <dl class="grid" id="shuntHead"></dl>
+      <hr>
+      <h2>Messwerte</h2>
+      <table class="fields" id="shuntFields"></table>
+      <hr>
+      <h2>Verbindung seit Start</h2>
+      <dl class="grid" id="shuntLink"></dl>
+      <p class="hint">Einstellungen des Shunts: folgen (W4b lesen, W4d ausgewählte Befehle).</p>
+    </section>
+
+    <!-- ===================== MPPT ===================== -->
+    <section id="tab-mppt" class="panel hidden">
+      <h2>Solarladeregler (MPPT)</h2>
+      <div id="mpptMissing" class="banner warn hidden">Kein MPPT erkannt (nicht angeschlossen oder ausgefallen).</div>
+      <dl class="grid" id="mpptHead"></dl>
+      <hr>
+      <h2>Messwerte</h2>
+      <table class="fields" id="mpptFields"></table>
+      <hr>
+      <h2>Verbindung seit Start</h2>
+      <dl class="grid" id="mpptLink"></dl>
+      <p class="hint">Einstellungen des MPPT werden später nur angezeigt (W4b). Ändern nur mit VictronConnect.</p>
+    </section>
+
+    <!-- ===================== Historie ===================== -->
+    <section id="tab-history" class="panel hidden">
+      <h2>Batterie (SmartShunt)</h2>
+      <table class="fields" id="histShunt"></table>
+      <hr>
+      <h2>Solar (MPPT)</h2>
+      <table class="fields" id="histMppt"></table>
+      <p class="hint">Die Historie stammt aus den Geräten selbst (Victron zählt seit Inbetriebnahme bzw. letztem Löschen).
+        Die 30-Tage-Historie des MPPT folgt in W4b.</p>
+    </section>
+
+    <!-- ===================== Fehler ===================== -->
+    <section id="tab-faults" class="panel hidden">
+      <h2>Aktive Fehler</h2>
+      <ul id="ftActive" class="faultlist"></ul>
+      <dl class="grid" id="ftDevice"></dl>
 
       <hr>
-      <h2>Paket (Firmware + WebUI)</h2>
-      <p>Empfohlen: <code>package_&lt;Version&gt;.tar</code>. Danach startet das Gerät neu.</p>
-      <input type="file" id="filePackage" accept=".tar">
-      <button class="upload" data-kind="package" data-input="filePackage">Paket hochladen</button>
+      <h2>Letzter Neustart</h2>
+      <dl class="grid">
+        <dt>Grund</dt>    <dd id="ftReset">–</dd>
+        <dt>Laufzeit</dt> <dd id="ftUptime">–</dd>
+      </dl>
 
       <hr>
-      <h2>Nur Firmware</h2>
-      <p><code>firmware_&lt;Version&gt;.bin</code>. Danach startet das Gerät neu.</p>
-      <input type="file" id="fileFirmware" accept=".bin">
-      <button class="upload" data-kind="firmware" data-input="fileFirmware">Firmware hochladen</button>
+      <h2>Ereignisse</h2>
+      <table class="events" id="ftEvents"></table>
+      <p class="hint">Die neuesten 50 Ereignisse, neueste oben. Die Liste wird beim Neustart gelöscht.
+        Zeitangaben vorerst relativ („vor …“), Uhrzeit folgt mit der Echtzeituhr.</p>
+    </section>
+
+    <!-- ===================== Einstellungen ===================== -->
+    <section id="tab-settings" class="panel hidden">
+      <h2>Relais</h2>
+      <p class="hint" style="margin-top:0">
+        SOC-Schwellen in %. Regel: <b>Aus unter ≤ Sperre unter ≤ Frei ab</b>.
+        Unter „Sperre“ lässt sich das Relais nicht einschalten, unter „Aus“ wird es abgeschaltet,
+        ab „Frei“ ist die Sperre wieder aufgehoben. Änderungen wirken sofort und bleiben nach einem Neustart erhalten.
+      </p>
+      <div id="setRelays"><p class="muted">Lade …</p></div>
+      <button id="setDefaultsBtn" class="secondary">Alle Relais auf Voreinstellung zurücksetzen</button>
 
       <hr>
-      <h2>Nur WebUI</h2>
-      <p><code>webui_&lt;Version&gt;.tar</code>. Kein Neustart nötig.</p>
-      <input type="file" id="fileWebui" accept=".tar">
-      <button class="upload" data-kind="webui" data-input="fileWebui">WebUI hochladen</button>
+      <h2>Anlage</h2>
+      <p>Bestimmt Namen, aktive Relais und die Voreinstellung der Schwellen.</p>
+      <label>Anlage
+        <select id="setInstallation">
+          <option value="camper">Camper (Wechselrichter, Licht, Kühlschrank)</option>
+          <option value="balcony">Balkonkraftwerk (DC-DC-Wandler)</option>
+        </select>
+      </label>
+      <button id="setInstallBtn" class="danger">Übernehmen und neu starten</button>
+      <p class="hint">Beim Wechsel werden alle geänderten Relais-Einstellungen auf die Voreinstellung
+        der neuen Anlage zurückgesetzt. Das Gerät startet neu, die Relais fallen dabei kurz ab.</p>
+    </section>
 
-      <div id="uploadBox" class="hidden">
+    <!-- ===================== System (Sammelreiter) ===================== -->
+    <section id="tab-system" class="panel hidden">
+      <nav class="subtabs">
+        <button class="subtab" data-sub="info">Info</button>
+        <button class="subtab" data-sub="wifi">WLAN</button>
+        <button class="subtab" data-sub="mqtt">MQTT</button>
+        <button class="subtab" data-sub="device">Gerät</button>
+        <button class="subtab" data-sub="update">Update</button>
+      </nav>
+
+      <!-- ---------- System → Info ---------- -->
+      <div id="sub-info" class="subpanel hidden">
+        <h2>Netzwerk</h2>
+        <dl class="grid">
+          <dt>Zustand</dt>        <dd id="stState">–</dd>
+          <dt>Letzter Fehler</dt> <dd id="stError">–</dd>
+          <dt>WLAN</dt>           <dd id="stSsid">–</dd>
+          <dt>IP-Adresse</dt>     <dd id="stIp">–</dd>
+          <dt>Signal</dt>         <dd id="stRssi">–</dd>
+          <dt>Access Point</dt>   <dd id="stAp">–</dd>
+          <dt>Adresse</dt>        <dd id="stHost">–</dd>
+          <dt>MQTT</dt>           <dd id="stMqtt">–</dd>
+        </dl>
+        <h2>Gerät</h2>
+        <dl class="grid">
+          <dt>Firmware</dt>       <dd id="stFw">–</dd>
+          <dt>WebUI</dt>          <dd id="stWebui">–</dd>
+          <dt>Laufzeit</dt>       <dd id="stUptime">–</dd>
+          <dt>Freier Speicher</dt><dd id="stHeap">–</dd>
+        </dl>
+      </div>
+
+      <!-- ---------- System → WLAN ---------- -->
+      <div id="sub-wifi" class="subpanel hidden">
+        <h2>WLAN verbinden</h2>
+        <form id="wifiForm">
+          <label>Netzwerk (SSID)
+            <input id="wifiSsid" name="ssid" maxlength="32" required list="ssidList" autocomplete="off">
+            <datalist id="ssidList"></datalist>
+          </label>
+          <button type="button" id="scanBtn" class="secondary">Netzwerke suchen</button>
+          <ul id="scanList" class="scanlist"></ul>
+
+          <label>Passwort
+            <input id="wifiPass" name="password" type="password" maxlength="63" autocomplete="new-password">
+            <small id="wifiPassHint">Leer lassen = bisheriges Passwort behalten.</small>
+          </label>
+          <label class="check small"><input type="checkbox" data-show="wifiPass"> Passwort anzeigen</label>
+
+          <label class="check">
+            <input id="apAlways" name="apAlways" type="checkbox">
+            Access Point immer eingeschaltet lassen (z. B. Camper ohne Router)
+          </label>
+
+          <button type="submit">Speichern und verbinden</button>
+        </form>
+
+        <h2>WLAN zurücksetzen</h2>
+        <p>Löscht die WLAN-Zugangsdaten. Das Gerät ist danach nur noch über seinen Access Point erreichbar.</p>
+        <button id="wifiResetBtn" class="danger">WLAN-Zugangsdaten löschen</button>
+      </div>
+
+      <!-- ---------- System → MQTT ---------- -->
+      <div id="sub-mqtt" class="subpanel hidden">
+        <dl class="grid">
+          <dt>Zustand</dt>       <dd id="mqState">–</dd>
+          <dt>Letzter Fehler</dt><dd id="mqError">–</dd>
+          <dt>Gesendet</dt>      <dd id="mqCounts">–</dd>
+        </dl>
+
         <hr>
-        <h2>Fortschritt</h2>
-        <progress id="uploadProgress" max="100" value="0"></progress>
-        <span id="uploadText"></span>
+        <h2>Einstellungen</h2>
+        <form id="mqttForm">
+          <label class="check">
+            <input id="mqEnabled" type="checkbox"> MQTT einschalten
+          </label>
+          <label>Broker (Hostname oder IP-Adresse)
+            <input id="mqHost" maxlength="64" placeholder="z. B. 192.168.178.20">
+          </label>
+          <label>Port
+            <input id="mqPort" type="number" min="1" max="65535" value="1883">
+          </label>
+          <label>Benutzer
+            <input id="mqUser" maxlength="64" autocomplete="off">
+            <small>Leer lassen = ohne Anmeldung.</small>
+          </label>
+          <label>Passwort
+            <input id="mqPass" type="password" maxlength="64" autocomplete="new-password">
+            <small id="mqPassHint">Leer lassen = bisheriges Passwort behalten.</small>
+          </label>
+          <label class="check small"><input type="checkbox" data-show="mqPass"> Passwort anzeigen</label>
+          <label>Basis-Topic
+            <input id="mqBase" maxlength="64" value="vedirect">
+          </label>
+          <label>Sendeintervall in Sekunden (1–3600)
+            <input id="mqInterval" type="number" min="1" max="3600" value="10">
+          </label>
+          <label>Client-ID
+            <input id="mqClient" maxlength="64" autocomplete="off">
+            <small>Leer lassen = automatisch (ve-direct-…).</small>
+          </label>
+          <button type="submit">Speichern und verbinden</button>
+          <button type="button" id="mqTestBtn" class="secondary">Verbindung testen</button>
+        </form>
+
+        <hr>
+        <h2>Topics</h2>
+        <p class="hint" style="margin-top:0">Senden (JSON, retained): <code id="tpBase1">vedirect</code>/status, /battery, /pv, /relays, /system.<br>
+          Befehle (ON/OFF): /relay/r1-set, /relay/r2-set, /relay/r3-set, /override-set. Rückmeldung: /command-result.</p>
+
+        <hr>
+        <h2>MQTT zurücksetzen</h2>
+        <button id="mqResetBtn" class="danger">MQTT-Einstellungen löschen</button>
       </div>
-      <p class="hint">Nach einem Firmware-Update läuft die neue Firmware zunächst auf Probe. Startet sie dreimal hintereinander nicht stabil (60 s), schaltet das Gerät automatisch auf die vorherige Firmware zurück.</p>
+
+      <!-- ---------- System → Gerät ---------- -->
+      <div id="sub-device" class="subpanel hidden">
+        <h2>Gerätepasswort ändern</h2>
+        <p>Gilt für den Access Point (WLAN-Passwort) <b>und</b> die Anmeldung an dieser Seite (Benutzer <code>admin</code>).</p>
+        <form id="pwForm">
+          <label>Aktuelles Passwort
+            <input id="pwCurrent" type="password" required autocomplete="current-password">
+          </label>
+          <label>Neues Passwort (8–63 Zeichen)
+            <input id="pwNew" type="password" minlength="8" maxlength="63" required autocomplete="new-password">
+          </label>
+          <label>Neues Passwort wiederholen
+            <input id="pwNew2" type="password" minlength="8" maxlength="63" required autocomplete="new-password">
+          </label>
+          <label class="check small"><input type="checkbox" data-show="pwCurrent,pwNew,pwNew2"> Passwörter anzeigen</label>
+          <button type="submit">Passwort ändern</button>
+        </form>
+
+        <h2>Neustart</h2>
+        <button id="restartBtn" class="secondary">Gerät neu starten</button>
+      </div>
+
+      <!-- ---------- System → Update ---------- -->
+      <div id="sub-update" class="subpanel hidden">
+        <div id="rollbackWarning" class="banner warn hidden">
+          Die zuletzt aufgespielte Firmware lief nicht stabil. Es wurde automatisch auf die vorherige Firmware zurückgeschaltet.
+        </div>
+        <dl class="grid">
+          <dt>Firmware</dt> <dd id="upFw">–</dd>
+          <dt>WebUI</dt>    <dd id="upWebui">–</dd>
+          <dt>Zustand</dt>  <dd id="upTrial">–</dd>
+        </dl>
+
+        <p>Die Dateien erzeugt der Build automatisch im Ordner <code>.pio/build/esp32dev/</code>.</p>
+
+        <hr>
+        <h2>Paket (Firmware + WebUI)</h2>
+        <p>Empfohlen: <code>package_&lt;Version&gt;.tar</code>. Danach startet das Gerät neu.</p>
+        <input type="file" id="filePackage" accept=".tar">
+        <button class="upload" data-kind="package" data-input="filePackage">Paket hochladen</button>
+
+        <hr>
+        <h2>Nur Firmware</h2>
+        <p><code>firmware_&lt;Version&gt;.bin</code>. Danach startet das Gerät neu.</p>
+        <input type="file" id="fileFirmware" accept=".bin">
+        <button class="upload" data-kind="firmware" data-input="fileFirmware">Firmware hochladen</button>
+
+        <hr>
+        <h2>Nur WebUI</h2>
+        <p><code>webui_&lt;Version&gt;.tar</code>. Kein Neustart nötig.</p>
+        <input type="file" id="fileWebui" accept=".tar">
+        <button class="upload" data-kind="webui" data-input="fileWebui">WebUI hochladen</button>
+
+        <div id="uploadBox" class="hidden">
+          <hr>
+          <h2>Fortschritt</h2>
+          <progress id="uploadProgress" max="100" value="0"></progress>
+          <span id="uploadText"></span>
+        </div>
+        <p class="hint">Nach einem Firmware-Update läuft die neue Firmware zunächst auf Probe. Startet sie dreimal hintereinander nicht stabil (60 s), schaltet das Gerät automatisch auf die vorherige Firmware zurück.</p>
+      </div>
     </section>
 
     <div id="toast" class="toast hidden"></div>
   </main>
 
   <footer>
-    Netzwerk-Reset am Gerät: Taste beim Einschalten 10 s gedrückt halten.
+    <label class="inline">Aktualisierung alle
+      <select id="refreshSel">
+        <option value="2">2 s</option>
+        <option value="5">5 s</option>
+        <option value="10">10 s</option>
+        <option value="30">30 s</option>
+      </select>
+      (nur dieser Browser)
+    </label>
+    <div>Netzwerk-Reset am Gerät: Taste beim Einschalten 10 s gedrückt halten, dann loslassen.</div>
   </footer>
 
   <script src="/app.js"></script>

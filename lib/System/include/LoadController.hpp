@@ -92,6 +92,34 @@ struct RelayConfig
     uint32_t    minOffTimeMs       = 0;      ///< automatisches Wiedereinschalten frühestens nach
 };
 
+/******************************************************************************
+ * W4a Schritt 5: In der WebUI änderbare Werte eines Relais (Projektinhaber
+ * 09.11.2026). NICHT änderbar: Name, aktiv/deaktiviert, Verhalten ohne SOC
+ * (requiresSoc/forceOffWithoutSoc) und erlaubte Befehlsquellen.
+ ******************************************************************************/
+struct RelayLimits
+{
+    float    lockBelowSoc    = 0.0f;   ///< Sperre unter (%)
+    float    offBelowSoc     = 0.0f;   ///< Aus unter (%)
+    float    releaseAtSoc    = 0.0f;   ///< Frei ab (%)
+    uint32_t minOffTimeMs    = 0;      ///< Mindest-Auszeit
+    bool     startupRequest  = false;  ///< Zustand nach Neustart (Wunsch ein)
+    bool     rememberRequest = false;  ///< nach Schutzabschaltung automatisch wieder ein
+
+    /// Längste erlaubte Mindest-Auszeit (1 h).
+    static constexpr uint32_t MaxMinOffTimeMs = 3600000;
+
+    /// Änderbare Werte aus einer Relais-Konfiguration übernehmen.
+    static RelayLimits from(const RelayConfig& config);
+
+    /// Werte in eine Relais-Konfiguration schreiben (Rest bleibt).
+    void applyTo(RelayConfig& config) const;
+
+    /// Plausibilität prüfen. nullptr = in Ordnung, sonst Fehlertext.
+    /// Regeln: 0 <= Aus <= Sperre <= Frei <= 100, Auszeit <= 1 h.
+    const char* validate() const;
+};
+
 struct LoadControllerConfig
 {
     RelayConfig relays[RelayCount];
@@ -109,7 +137,8 @@ enum class CommandResult : uint8_t
     Deferred,           ///< Wunsch gespeichert, wird bei ausreichendem SOC ausgeführt
     RejectedLocked,     ///< SOC zu niedrig oder kein gültiger SOC
     RejectedSource,     ///< Befehlsquelle für dieses Relais nicht erlaubt
-    RejectedDisabled    ///< Relais ist deaktiviert
+    RejectedDisabled,   ///< Relais ist deaktiviert
+    RejectedInvalid     ///< W4a: ungültige Einstellungswerte
 };
 
 /// Aktueller Sollzustand eines Relais.
@@ -133,6 +162,11 @@ public:
     /// Konfiguration ändern (z. B. später aus der WebUI), Zustand bleibt.
     void setConfig(const LoadControllerConfig& config) { m_config = config; }
     const LoadControllerConfig& config() const       { return m_config; }
+
+    /// W4a: Änderbare Werte eines Relais setzen (WebUI). Zustand und Wunsch
+    /// bleiben; die neuen Schwellen wirken beim nächsten update().
+    /// Abgelehnt bei deaktiviertem Relais oder ungültigen Werten.
+    CommandResult setLimits(RelayId relay, const RelayLimits& limits);
 
     /// Zustand nach (Neu-)Start herstellen. Override wird beendet.
     void start(uint32_t nowMs);

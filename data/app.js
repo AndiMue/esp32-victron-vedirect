@@ -1,4 +1,4 @@
-// VE.Direct WebUI – Stufe W1
+// VE.Direct WebUI – Stufen W1–W3 (System), W4a (Projekt-Reiter)
 // Reines JavaScript, keine externen Bibliotheken (funktioniert auch im AP ohne Internet).
 "use strict";
 
@@ -43,18 +43,52 @@ const stateText = {
 };
 
 // ---------------------------------------------------------------------------
-// Reiter
+// Browser-Speicher (nur Komfort: zuletzt gewählter Reiter usw.).
+// Kann gesperrt sein (privates Fenster) -> dann einfach Standardwerte.
 // ---------------------------------------------------------------------------
+function loadPref(key, fallback) {
+  try { return localStorage.getItem("vedirect." + key) || fallback; } catch (e) { return fallback; }
+}
+function savePref(key, value) {
+  try { localStorage.setItem("vedirect." + key, value); } catch (e) { /* egal */ }
+}
+
+// ---------------------------------------------------------------------------
+// Reiter (W4a): Hauptreiter + Unterreiter im Sammelreiter "System"
+// ---------------------------------------------------------------------------
+let currentTab = "";
+let currentSub = "";
+
+function showSub(name) {
+  if (!$("sub-" + name)) name = "info";
+  currentSub = name;
+  savePref("sub", name);
+  document.querySelectorAll(".subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === name));
+  document.querySelectorAll(".subpanel").forEach((p) => p.classList.toggle("hidden", p.id !== "sub-" + name));
+  if (name === "wifi") loadWifi();
+  if (name === "mqtt") loadMqtt();
+}
+
+function showTab(name) {
+  if (!$("tab-" + name)) name = "overview";
+  currentTab = name;
+  savePref("tab", name);
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("hidden", p.id !== "tab-" + name));
+  if (name === "system") showSub(currentSub || loadPref("sub", "info"));
+  if (name === "overview") refreshLive();
+  if (name === "shunt" || name === "mppt" || name === "history") refreshDevices();
+  if (name === "faults") refreshFaults();
+  if (name === "settings") loadSettings();
+}
+
 document.querySelectorAll(".tab").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
-    document.querySelectorAll(".panel").forEach((p) => p.classList.add("hidden"));
-    btn.classList.add("active");
-    $("tab-" + btn.dataset.tab).classList.remove("hidden");
-    if (btn.dataset.tab === "wifi") loadWifi();
-    if (btn.dataset.tab === "mqtt") loadMqtt();
-  });
+  btn.addEventListener("click", () => showTab(btn.dataset.tab));
 });
+document.querySelectorAll(".subtab").forEach((btn) => {
+  btn.addEventListener("click", () => showSub(btn.dataset.sub));
+});
+showTab(loadPref("tab", "overview"));
 
 // ---------------------------------------------------------------------------
 // "Passwort anzeigen": Checkbox mit data-show="feld1,feld2"
@@ -98,12 +132,436 @@ async function refreshStatus() {
     $("stUptime").textContent = formatUptime(s.uptimeS);
     $("stHeap").textContent = Math.round(s.freeHeap / 1024) + " KB";
     $("pwWarning").classList.toggle("hidden", !s.defaultPassword);
+    showFaultSummary(s.faults);
   } catch (e) {
     $("stState").textContent = "Keine Verbindung zum Gerät";
   }
 }
-refreshStatus();
-setInterval(refreshStatus, 3000);
+
+// Markierung am Reiter "Fehler" und Banner bei kritischen Fehlern (alle Reiter)
+function showFaultSummary(f) {
+  if (!f) return;
+  $("faultBadge").textContent = f.count;
+  // Jeder aktive Fehler = rot, unabhängig von der Schwere (Projektinhaber 09.11.2026)
+  $("faultBadge").classList.toggle("hidden", f.count === 0);
+  $("critBanner").classList.toggle("hidden", f.severity !== "critical");
+}
+$("critLink").addEventListener("click", (ev) => { ev.preventDefault(); showTab("faults"); });
+
+// ---------------------------------------------------------------------------
+// Aktualisierung (W4a): ein Takt für alles, im Browser wählbar (Standard 5 s).
+// Läuft nicht, solange die Seite im Hintergrund ist.
+// ---------------------------------------------------------------------------
+let refreshTimer = null;
+
+async function refreshAll() {
+  if (document.hidden) return;
+  await refreshStatus();
+  if (currentTab === "overview") await refreshLive();
+  if (currentTab === "shunt" || currentTab === "mppt" || currentTab === "history") await refreshDevices();
+  if (currentTab === "faults") await refreshFaults();
+}
+
+function startRefresh() {
+  const s = parseInt(loadPref("refresh", "5"), 10) || 5;
+  $("refreshSel").value = String(s);
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(refreshAll, s * 1000);
+}
+
+$("refreshSel").addEventListener("change", () => {
+  savePref("refresh", $("refreshSel").value);
+  startRefresh();
+});
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAll(); });
+
+// ---------------------------------------------------------------------------
+// Übersicht (W4a Schritt 2)
+// ---------------------------------------------------------------------------
+function num(v, digits) {
+  return v.toLocaleString("de-DE", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function fmt(v, digits, unit) {
+  return v === null || v === undefined ? "–" : num(v, digits) + " " + unit;
+}
+function formatTtg(b) {
+  if (b.timeToGoInfinite) return "∞ (keine Entladung)";
+  if (b.timeToGoMin === null) return "–";
+  const h = Math.floor(b.timeToGoMin / 60);
+  return (h ? h + " h " : "") + (b.timeToGoMin % 60) + " min";
+}
+
+const linkText = { ok: "● ok", instabil: "◐ instabil", defekt: "⊗ fehlt / ausgefallen" };
+
+function relayInfo(i, r, lim, live) {
+  const parts = [];
+  const on = r["r" + i] === "ON";
+  const wanted = r["r" + i + "Wanted"];
+  const soc = live.battery.soc;
+  if (r.override === "ON") {
+    parts.push("Override: Sperren aufgehoben");
+  } else if (r["r" + i + "Locked"]) {
+    parts.push(lim.requiresSoc && soc === null
+      ? "🔒 gesperrt: kein gültiger SOC (Shunt fehlt)"
+      : "🔒 Einschalten gesperrt bis SOC " + num(lim.release, 0) + " %");
+  }
+  if (wanted && !on && r.override !== "ON") parts.push("Einschalten gewünscht, wartet auf ausreichenden SOC");
+  parts.push("Schwellen: gesperrt unter " + num(lim.lock, 0) + " %, aus unter " + num(lim.off, 0) +
+             " %, frei ab " + num(lim.release, 0) + " %");
+  if (r["r" + i + "Reason"]) parts.push("Letzte Änderung: " + r["r" + i + "Reason"]);
+  return parts.join("<br>");
+}
+
+function buildRelayRows(live) {
+  const box = $("ovRelays");
+  if (box.children.length) return;
+  for (let i = 1; i <= live.limits.length; i++) {
+    const div = document.createElement("div");
+    div.className = "relay";
+    div.innerHTML =
+      '<div class="relay-head">' +
+        '<span class="relay-name" id="rlName' + i + '">R' + i + '</span>' +
+        '<span class="pill" id="rlState' + i + '">–</span>' +
+        '<span class="relay-buttons" id="rlBtns' + i + '">' +
+          '<button class="small" data-relay="' + i + '" data-on="ON">Ein</button>' +
+          '<button class="small secondary" data-relay="' + i + '" data-on="OFF">Aus</button>' +
+        '</span>' +
+      '</div>' +
+      '<div class="relay-info" id="rlInfo' + i + '"></div>';
+    box.appendChild(div);
+  }
+  box.querySelectorAll("button[data-relay]").forEach((b) => {
+    b.addEventListener("click", () => sendRelay(b.dataset.relay, b.dataset.on));
+  });
+}
+
+function showLive(live) {
+  const b = live.battery, p = live.pv, r = live.relays, s = live.system;
+
+  // Batterie
+  $("ovSoc").textContent = b.soc === null ? "– – %" : num(b.soc, 1) + " %";
+  let dir = "";
+  if (b.current !== null) dir = b.current > 0.05 ? "▲ lädt" : (b.current < -0.05 ? "▼ entlädt" : "o Ruhe");
+  $("ovDir").textContent = dir;
+  const star = b.voltageSource === "mppt" ? " *" : "";
+  $("ovVoltage").textContent = fmt(b.voltage, 2, "V") + star;
+  $("ovVoltHint").classList.toggle("hidden", b.voltageSource !== "mppt");
+  $("ovCurrent").textContent = fmt(b.current, 2, "A");
+  $("ovPower").textContent = fmt(b.power, 0, "W");
+  $("ovTtg").textContent = formatTtg(b);
+  $("ovConsumed").textContent = fmt(b.consumedAh, 1, "Ah");
+
+  // Solar
+  $("ovPvPower").textContent = fmt(p.power, 0, "W");
+  $("ovPvVoltage").textContent = fmt(p.voltage, 2, "V");
+  $("ovPvState").textContent = p.state || "–";
+  $("ovPvYield").textContent = fmt(p.yieldTodayKWh, 2, "kWh");
+  $("ovPvError").textContent = p.errorCode === null ? "–" : (p.errorCode === 0 ? "keiner" : "Code " + p.errorCode);
+
+  // Relais
+  buildRelayRows(live);
+  for (let i = 1; i <= live.limits.length; i++) {
+    const st = r["r" + i];
+    $("rlName" + i).textContent = "R" + i + " " + (r["r" + i + "Name"] || "");
+    const pill = $("rlState" + i);
+    pill.textContent = st === "ON" ? "EIN" : (st === "OFF" ? "AUS" : "deaktiviert");
+    pill.className = "pill " + (st === "ON" ? "on" : (st === "OFF" ? "off" : "disabled"));
+    $("rlBtns" + i).classList.toggle("hidden", st === "DISABLED");
+    $("rlInfo" + i).innerHTML = st === "DISABLED" ? "In dieser Anlage nicht verwendet." : relayInfo(i, r, live.limits[i - 1], live);
+  }
+  const ovr = r.override === "ON";
+  $("ovOverrideState").textContent = ovr ? "AKTIV" : "AUS";
+  $("ovOverrideState").className = "pill " + (ovr ? "warn" : "off");
+  $("ovOverrideBanner").classList.toggle("hidden", !ovr);
+
+  // Verbindung
+  $("ovLinkShunt").textContent = linkText[s.shunt] || s.shunt;
+  $("ovLinkMppt").textContent = linkText[s.mppt] || s.mppt;
+  $("ovUpdated").textContent = "Stand: " + new Date().toLocaleTimeString("de-DE");
+}
+
+async function refreshLive() {
+  try {
+    showLive(await api("/api/live"));
+  } catch (e) {
+    $("ovUpdated").textContent = "Keine Verbindung zum Gerät";
+  }
+}
+
+let commandBusy = false;
+async function sendCommand(path, data) {
+  if (commandBusy) return;
+  commandBusy = true;
+  document.querySelectorAll("#tab-overview button").forEach((b) => (b.disabled = true));
+  try {
+    const res = await api(path, data);
+    toast(res.result, !res.ok);
+    if (res.live) showLive(res.live);
+  } catch (e) {
+    toast(e.message, true);
+  }
+  document.querySelectorAll("#tab-overview button").forEach((b) => (b.disabled = false));
+  commandBusy = false;
+}
+
+function sendRelay(relay, on) {
+  sendCommand("/api/relay", { relay: relay, on: on });
+}
+
+$("ovOverrideOn").addEventListener("click", () => {
+  if (!confirm("Override einschalten?\n\nAlle Schutzsperren (SOC-Schwellen, fehlender Shunt) werden aufgehoben. " +
+               "Nur noch das BMS schützt den Akku vor Tiefentladung. Die Verantwortung liegt beim Benutzer.")) return;
+  sendCommand("/api/override", { on: "ON" });
+});
+$("ovOverrideOff").addEventListener("click", () => sendCommand("/api/override", { on: "OFF" }));
+
+// ---------------------------------------------------------------------------
+// Shunt, MPPT, Historie (W4a Schritt 3): alle Felder in Klartext
+// ---------------------------------------------------------------------------
+const StaleAfterS = 10;   // älter = grau mit "vor x s"
+
+function escapeHtml(t) {
+  return String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function fieldRows(fields) {
+  if (!fields.length) return '<tr><td class="muted">Keine Werte empfangen.</td></tr>';
+  return fields.map((f) => {
+    const stale = f.ageS > StaleAfterS;
+    return '<tr' + (stale ? ' class="stale"' : '') + '>' +
+      '<td>' + escapeHtml(f.name) + '</td>' +
+      '<td>' + escapeHtml(f.value) + (stale ? ' <span class="lbl">(vor ' + f.ageS + ' s)</span>' : '') + '</td></tr>';
+  }).join("");
+}
+
+function grid(rows) {
+  return rows.map(([k, v]) => "<dt>" + escapeHtml(k) + "</dt><dd>" + escapeHtml(v) + "</dd>").join("");
+}
+
+function renderDevice(prefix, d) {
+  $(prefix + "Missing").classList.toggle("hidden", d.present);
+  if (!d.present) {
+    $(prefix + "Head").innerHTML = "";
+    $(prefix + "Fields").innerHTML = "";
+    $(prefix + "Link").innerHTML = "";
+    return;
+  }
+  $(prefix + "Head").innerHTML = grid([
+    ["Gerät", d.device],
+    ["Anschluss", d.uart],
+    ["Letzter Datenblock", "vor " + num(d.lastFrameAgoMs / 1000, 1) + " s"],
+  ]);
+  $(prefix + "Fields").innerHTML = fieldRows(d.fields.filter((f) => !f.history));
+  const l = d.link;
+  $(prefix + "Link").innerHTML = grid([
+    ["Zustand", l.unstable ? "◐ instabil" : "● ok"],
+    ["Prüfsummenfehler", String(l.checksumErrors)],
+    ["Verworfene Blöcke", String(l.discarded)],
+    ["Ausfälle", String(l.outages) + (l.lastOutageMs ? " (letzter " + num(l.lastOutageMs / 1000, 0) + " s)" : "")],
+    ["Als instabil eingestuft", l.unstableCount + "×"],
+    ["Verlorene Meldungen", String(l.queueDrops)],
+  ]);
+}
+
+function renderHistory(id, d) {
+  $(id).innerHTML = d.present
+    ? fieldRows(d.fields.filter((f) => f.history))
+    : '<tr><td class="muted">Gerät nicht erkannt.</td></tr>';
+}
+
+async function refreshDevices() {
+  try {
+    if (currentTab === "shunt" || currentTab === "history") {
+      const s = await api("/api/device?role=shunt");
+      if (currentTab === "shunt") renderDevice("shunt", s); else renderHistory("histShunt", s);
+    }
+    if (currentTab === "mppt" || currentTab === "history") {
+      const m = await api("/api/device?role=mppt");
+      if (currentTab === "mppt") renderDevice("mppt", m); else renderHistory("histMppt", m);
+    }
+  } catch (e) {
+    toast("Keine Verbindung zum Gerät", true);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fehler (W4a Schritt 4): aktive Fehler, Neustart-Grund, Ereignisliste
+// ---------------------------------------------------------------------------
+const severityText = { critical: "kritisch", warning: "Warnung", info: "Info", none: "" };
+
+function formatAgo(s) {
+  if (s < 60) return "vor " + s + " s";
+  if (s < 3600) return "vor " + Math.floor(s / 60) + " min";
+  const h = Math.floor(s / 3600);
+  if (h < 48) return "vor " + h + " h " + Math.floor((s % 3600) / 60) + " min";
+  return "vor " + Math.floor(h / 24) + " d " + (h % 24) + " h";
+}
+
+function sevPill(sev) {
+  return '<span class="sev ' + sev + '">' + escapeHtml(severityText[sev] || sev) + "</span>";
+}
+
+async function refreshFaults() {
+  try {
+    const f = await api("/api/faults");
+    $("ftActive").innerHTML = f.active.length
+      ? f.active.map((a) => "<li>" + sevPill(a.severity) + " " + escapeHtml(a.text) + "</li>").join("")
+      : '<li class="ok">✓ Keine aktiven Fehler</li>';
+    const dev = [];
+    if (f.pvError) dev.push(["MPPT meldet", f.pvError]);
+    if (f.batteryAlarm) dev.push(["Shunt-Alarm", f.batteryAlarm]);
+    $("ftDevice").innerHTML = grid(dev);
+    $("ftReset").innerHTML = sevPill(f.reset.severity) + " " + escapeHtml(f.reset.text);
+    $("ftUptime").textContent = formatUptime(f.uptimeS);
+    $("ftEvents").innerHTML = f.events.length
+      ? f.events.map((e) =>
+          '<tr><td class="when">' + formatAgo(e.ageS) + "</td><td>" + sevPill(e.severity) +
+          "</td><td>" + escapeHtml(e.text) + "</td></tr>").join("")
+      : '<tr><td class="muted">Keine Ereignisse.</td></tr>';
+  } catch (e) {
+    toast("Keine Verbindung zum Gerät", true);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Einstellungen (W4a Schritt 5)
+// Wird NICHT im Takt aktualisiert, sonst würden Eingaben überschrieben.
+// "var" statt "let": showTab() läuft schon oben beim Laden der Datei.
+// ---------------------------------------------------------------------------
+var settingsInstallation = "";
+
+function onOffText(v) { return v ? "ein" : "aus"; }
+
+function numField(i, key, label, unit, value, preset, step, max) {
+  return '<label>' + label + ' (' + unit + ')' +
+    '<input type="number" id="set' + key + i + '" min="0" max="' + max + '" step="' + step +
+    '" value="' + value + '" inputmode="decimal">' +
+    '<small>Voreinstellung: ' + preset + ' ' + unit + '</small></label>';
+}
+
+function relaySettingsCard(i, r, maxMinOffS) {
+  const head = '<div class="relay-head"><span class="relay-name">R' + (i + 1) + " " + escapeHtml(r.name) +
+    "</span>" + (r.custom ? '<span class="pill warn">geändert</span>' : '<span class="pill off">Voreinstellung</span>') +
+    "</div>";
+  if (!r.enabled) {
+    return '<div class="relay"><div class="relay-head"><span class="relay-name">R' + (i + 1) + " " +
+      escapeHtml(r.name) + '</span><span class="pill disabled">deaktiviert</span></div>' +
+      '<div class="relay-info">In dieser Anlage nicht verwendet.</div></div>';
+  }
+  const p = r.preset;
+  const noSoc = r.requiresSoc
+    ? (r.forceOffWithoutSoc ? "gesperrt und ausgeschaltet" : "gesperrt")
+    : "Zustand bleibt";
+  return '<div class="relay" data-relay="' + (i + 1) + '">' + head +
+    '<div class="setgrid">' +
+    numField(i, "Lock", "Sperre unter", "%", r.lock, p.lock, "0.1", 100) +
+    numField(i, "Off", "Aus unter", "%", r.off, p.off, "0.1", 100) +
+    numField(i, "Release", "Frei ab", "%", r.release, p.release, "0.1", 100) +
+    numField(i, "MinOff", "Mindest-Auszeit", "s", r.minOffS, p.minOffS, "1", maxMinOffS) +
+    "</div>" +
+    '<label>Zustand nach Neustart<select id="setStartup' + i + '">' +
+    '<option value="OFF"' + (r.startup ? "" : " selected") + ">aus</option>" +
+    '<option value="ON"' + (r.startup ? " selected" : "") + ">ein (sobald freigegeben)</option>" +
+    "</select><small>Voreinstellung: " + onOffText(p.startup) + "</small></label>" +
+    '<label class="check"><input type="checkbox" id="setAuto' + i + '"' + (r.auto ? " checked" : "") + ">" +
+    "<span>Nach Schutzabschaltung automatisch wieder ein (wenn der SOC wieder reicht)" +
+    "<small>Voreinstellung: " + (p.auto ? "ja" : "nein") + "</small></span></label>" +
+    '<div class="relay-info">Ohne gültigen SOC (Shunt fehlt): ' + noSoc + " (fest).</div>" +
+    '<div class="relay-buttons"><button class="small" data-save="' + i + '">Speichern</button>' +
+    (r.custom ? '<button class="small secondary" data-reset="' + i + '">Auf Voreinstellung</button>' : "") +
+    "</div></div>";
+}
+
+function showSettings(s) {
+  settingsInstallation = s.installation;
+  $("setInstallation").value = s.installation;
+  $("setRelays").innerHTML = s.relays.map((r, i) => relaySettingsCard(i, r, s.maxMinOffS)).join("");
+  document.querySelectorAll("#setRelays button[data-save]").forEach((btn) => {
+    btn.addEventListener("click", () => saveRelaySettings(parseInt(btn.dataset.save, 10), btn));
+  });
+  document.querySelectorAll("#setRelays button[data-reset]").forEach((btn) => {
+    btn.addEventListener("click", () => resetRelaySettings(parseInt(btn.dataset.reset, 10), btn));
+  });
+}
+
+// Ein einzelnes Relais auf die Voreinstellung der Anlage zurücksetzen
+async function resetRelaySettings(i, btn) {
+  if (!confirm("R" + (i + 1) + " auf die Voreinstellung zurücksetzen?\n" +
+               "Die Werte wirken sofort; das Relais kann dadurch abschalten.")) return;
+  btn.disabled = true;
+  try {
+    const res = await api("/api/settings/defaults", { relay: i + 1 });
+    toast("R" + (i + 1) + ": " + res.result, !res.ok);
+    showSettings(res.settings);
+  } catch (e) {
+    toast("R" + (i + 1) + ": " + e.message, true);
+    btn.disabled = false;
+  }
+}
+
+async function loadSettings() {
+  try {
+    showSettings(await api("/api/settings"));
+  } catch (e) {
+    toast("Einstellungen konnten nicht geladen werden: " + e.message, true);
+  }
+}
+
+async function saveRelaySettings(i, btn) {
+  const data = {
+    relay: i + 1,
+    lock: $("setLock" + i).value,
+    off: $("setOff" + i).value,
+    release: $("setRelease" + i).value,
+    minOffS: $("setMinOff" + i).value,
+    startup: $("setStartup" + i).value,
+    auto: $("setAuto" + i).checked ? "ON" : "OFF",
+  };
+  btn.disabled = true;
+  try {
+    const res = await api("/api/settings/relay", data);
+    toast("R" + (i + 1) + ": " + res.result, !res.ok);
+    showSettings(res.settings);
+  } catch (e) {
+    toast("R" + (i + 1) + ": " + e.message, true);
+    btn.disabled = false;
+  }
+}
+
+$("setDefaultsBtn").addEventListener("click", async () => {
+  if (!confirm("Alle Relais-Einstellungen auf die Voreinstellung der Anlage zurücksetzen?\n" +
+               "Die Werte wirken sofort; ein Relais kann dadurch abschalten.")) return;
+  try {
+    const res = await api("/api/settings/defaults", {});
+    toast(res.result, !res.ok);
+    showSettings(res.settings);
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+$("setInstallBtn").addEventListener("click", async () => {
+  const value = $("setInstallation").value;
+  if (value === settingsInstallation) { toast("Anlage ist bereits ausgewählt."); return; }
+  const name = $("setInstallation").selectedOptions[0].textContent;
+  if (!confirm("Anlage wechseln auf „" + name + "“?\n\n" +
+               "• Alle geänderten Relais-Einstellungen werden auf die Voreinstellung zurückgesetzt.\n" +
+               "• Das Gerät startet neu, alle Relais fallen dabei kurz ab.")) return;
+  try {
+    const res = await api("/api/settings/installation", { value: value });
+    toast(res.result);
+    if (res.restart) {
+      $("setInstallBtn").disabled = true;
+      setTimeout(() => location.reload(), 15000);
+    }
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
+// Start: sofort einmal alles holen, dann im gewählten Takt
+startRefresh();
+refreshAll();
 
 // ---------------------------------------------------------------------------
 // WLAN
