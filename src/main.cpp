@@ -68,6 +68,7 @@
 #include "LinkMonitor.hpp"
 #include "EventLog.hpp"
 #include "FieldCatalog.hpp"
+#include "SettingsBackup.hpp"
 #include "LoadController.hpp"
 #include "SystemState.hpp"
 #include "ValueConverter.hpp"
@@ -1346,6 +1347,8 @@ void loadInstallation()
 /******************************************************************************
  * System-Task: 1×/s Systemzustand + Abschaltlogik; Befehle sofort.
  ******************************************************************************/
+void checkMemoryHealth();   // W5: definiert bei g_tasks (Speicher-Überwachung)
+
 void systemTask(void*)
 {
     // Relais-Voreinstellung je Anlage plus in der WebUI geänderte Werte (NVS);
@@ -1436,6 +1439,7 @@ void systemTask(void*)
 
         state = evaluateSystem();
         logFaultChanges(state.faults, loggedFaults, faultsLogged);
+        checkMemoryHealth();   // W5: 1×/min, Warnung bei knappem Speicher
         captureRelays(relaysBefore);
         g_loadController.update(state, millis());
         g_relays.apply(g_loadController);
@@ -1554,6 +1558,104 @@ void webTask(void*)
  ******************************************************************************/
 constexpr uint32_t    MqttTaskStack    = 6144;
 constexpr UBaseType_t MqttTaskPriority = 1;
+
+/******************************************************************************
+ * W5: Übersicht der Tasks für die Speicher-Diagnose (Monitor "speicher").
+ * Handles werden in setup() beim Anlegen eingetragen (Reihenfolge fest).
+ ******************************************************************************/
+struct TaskInfo
+{
+    const char*  name;
+    uint32_t     stackBytes;
+    TaskHandle_t handle;
+};
+
+TaskInfo g_tasks[] =
+{
+    { "Logger",  LoggerTaskStack,  nullptr },
+    { "System",  SystemTaskStack,  nullptr },
+    { "Display", DisplayTaskStack, nullptr },
+    { "Web",     WebTaskStack,     nullptr },
+    { "Mqtt",    MqttTaskStack,    nullptr },
+    { "UART1",   UartTaskStack,    nullptr },
+    { "UART2",   UartTaskStack,    nullptr },
+};
+
+/******************************************************************************
+ * W5: Speicher-Überwachung ohne Zuschauer (Projektinhaber 11.11.2026).
+ * Schleichende Verschlechterung soll auch ohne Monitor auffallen:
+ * Warnung in der Ereignisliste, wenn der kleinste freie Heap seit Start
+ * unter HeapWarnBytes fällt oder eine Task weniger als StackWarnBytes
+ * Stack-Reserve hatte. Je Ursache nur EINMAL (Werte sind "seit Start").
+ ******************************************************************************/
+constexpr uint32_t HeapWarnBytes   = 30 * 1024;
+constexpr uint32_t StackWarnBytes  = 1024;
+constexpr uint32_t MemoryCheckMs   = 60000;
+
+/// Knappste Stack-Reserve aller Tasks (Byte); name = betroffene Task.
+uint32_t minStackReserve(const char*& name)
+{
+    uint32_t best = UINT32_MAX;
+    name = "";
+    for (const TaskInfo& t : g_tasks)
+    {
+        if (t.handle == nullptr) continue;
+        const uint32_t freeMin = uxTaskGetStackHighWaterMark(t.handle);
+        if (freeMin < best)
+        {
+            best = freeMin;
+            name = t.name;
+        }
+    }
+    return best == UINT32_MAX ? 0 : best;
+}
+
+/// Zusatz für /api/status: kleinster freier Heap seit Start, knappste Stack-Reserve.
+String memoryStatusJson()
+{
+    const char* task = "";
+    const uint32_t stack = minStackReserve(task);
+    return ",\"memory\":{\"minFreeHeap\":" + String(ESP.getMinFreeHeap()) +
+           ",\"minStack\":" + String(stack) +
+           ",\"minStackTask\":" + WebUi::jsonString(task) +
+           ",\"heapWarn\":" + String(HeapWarnBytes) +
+           ",\"stackWarn\":" + String(StackWarnBytes) + "}";
+}
+
+/// Aus der systemTask aufrufen (1×/s); prüft nur alle MemoryCheckMs.
+void checkMemoryHealth()
+{
+    static uint32_t lastMs    = 0;
+    static bool     heapWarned = false;
+    static bool     stackWarned[sizeof(g_tasks) / sizeof(g_tasks[0])] = {};
+
+    const uint32_t now = millis();
+    if (now - lastMs < MemoryCheckMs)
+    {
+        return;
+    }
+    lastMs = now;
+
+    const uint32_t minHeap = ESP.getMinFreeHeap();
+    if (!heapWarned && minHeap < HeapWarnBytes)
+    {
+        heapWarned = true;
+        addEvent(Severity::Warning, "Arbeitsspeicher knapp: kleinster freier Wert seit Start %lu KB (Grenze %lu KB)",
+                 static_cast<unsigned long>(minHeap / 1024), static_cast<unsigned long>(HeapWarnBytes / 1024));
+    }
+    for (size_t i = 0; i < sizeof(g_tasks) / sizeof(g_tasks[0]); ++i)
+    {
+        if (g_tasks[i].handle == nullptr || stackWarned[i]) continue;
+        const uint32_t freeMin = uxTaskGetStackHighWaterMark(g_tasks[i].handle);
+        if (freeMin < StackWarnBytes)
+        {
+            stackWarned[i] = true;
+            addEvent(Severity::Warning, "Stack der Task %s knapp: Reserve min. %lu Byte von %lu",
+                     g_tasks[i].name, static_cast<unsigned long>(freeMin),
+                     static_cast<unsigned long>(g_tasks[i].stackBytes));
+        }
+    }
+}
 
 /// Messwert als JSON-Zahl, ungültig = null.
 String jsonNumber(const Reading& r, unsigned decimals)
@@ -1792,7 +1894,8 @@ String buildStatusExtension()
     return "\"faults\":{\"count\":" + String(count) + ",\"severity\":\"" + severity + "\"}" +
            ",\"clock\":{\"valid\":" + String(clockValid() ? "true" : "false") +
            ",\"local\":" + WebUi::jsonString(formatLocalTime(clockNowUnix())) +   // leer, wenn ungültig
-           ",\"source\":\"" + clockSourceKey(static_cast<ClockSource>(g_clockSource.load())) + "\"}";
+           ",\"source\":\"" + clockSourceKey(static_cast<ClockSource>(g_clockSource.load())) + "\"}" +
+           memoryStatusJson();   // W5: Speicher-Überwachung (System → Info)
 }
 
 /******************************************************************************
@@ -2170,6 +2273,172 @@ int handleRelaySettings(const ApiRequest& req, String& out)
 }
 
 /******************************************************************************
+ * W5: Sicherung / Wiederherstellung aller Einstellungen
+ *
+ * Die Namensräume und Schlüssel von WLAN ("net") und MQTT ("mqtt") gehören
+ * zu lib/WebCore (WifiManager.cpp, MqttManager.cpp) und MÜSSEN mit den
+ * dortigen Konstanten übereinstimmen. Passwörter ("pass", "devpw") werden
+ * weder gelesen noch geschrieben (Projektinhaber: bleiben auf dem Gerät).
+ ******************************************************************************/
+const char* const NvsNet  = "net";    // = WifiManager.cpp
+const char* const NvsMqtt = "mqtt";   // = MqttManager.cpp
+
+std::string toStd(const String& s) { return std::string(s.c_str()); }
+
+/// Aktuelle Einstellungen aus dem Flash einsammeln.
+BackupData collectBackup()
+{
+    BackupData d;
+    d.firmware = FirmwareVersion;
+    d.created  = toStd(formatLocalTime(clockNowUnix()));
+    d.balcony  = SettingsStore::getUInt(NvsApp, "install", 0) == 1;
+
+    const LoadControllerConfig preset = d.balcony ? LoadControllerConfig::balcony()
+                                                  : LoadControllerConfig::camper();
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        // Strategie C: immer die wirksamen Werte (gespeicherte oder Voreinstellung)
+        const RelayLimits def = RelayLimits::from(preset.relays[i]);
+        if (!loadRelayLimits(i, def, d.relays[i]))
+        {
+            d.relays[i] = def;
+        }
+    }
+
+    d.tz  = toStd(g_tzKey);
+    d.ntp = g_ntpServer;
+
+    d.mqttEnabled  = SettingsStore::getBool(NvsMqtt, "enabled", false);
+    d.mqttHost     = toStd(SettingsStore::getString(NvsMqtt, "host"));
+    d.mqttPort     = SettingsStore::getUInt(NvsMqtt, "port", 1883);
+    d.mqttUser     = toStd(SettingsStore::getString(NvsMqtt, "user"));
+    d.mqttBase     = toStd(SettingsStore::getString(NvsMqtt, "base", "vedirect"));
+    d.mqttInterval = SettingsStore::getUInt(NvsMqtt, "interval", 10);
+    d.mqttClient   = toStd(SettingsStore::getString(NvsMqtt, "client"));
+
+    d.wifiSsid = toStd(SettingsStore::getString(NvsNet, "ssid"));
+    d.apAlways = SettingsStore::getBool(NvsNet, "apalways", false);
+    d.hostname = toStd(SettingsStore::getString(NvsNet, "host"));
+    return d;
+}
+
+/// Geprüfte Sicherung in den Flash schreiben (danach Neustart!).
+/// Passwörter bleiben unverändert. false = Schreibfehler (teilweise geschrieben).
+bool applyBackup(const BackupData& d)
+{
+    bool ok = true;
+    ok &= SettingsStore::putUInt(NvsApp, "install", d.balcony ? 1 : 0);
+
+    // Strategie C: nur Werte speichern, die von der Voreinstellung der
+    // (wiederhergestellten) Anlage abweichen; sonst gilt die Voreinstellung.
+    SettingsStore::clear(NvsRelays);
+    const LoadControllerConfig preset = d.balcony ? LoadControllerConfig::balcony()
+                                                  : LoadControllerConfig::camper();
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        if (preset.relays[i].enabled && !sameLimits(d.relays[i], RelayLimits::from(preset.relays[i])))
+        {
+            ok &= saveRelayLimits(i, d.relays[i]);
+        }
+    }
+
+    ok &= SettingsStore::putString(NvsClock, "tz", d.tz.c_str());
+    ok &= SettingsStore::putString(NvsClock, "ntp", d.ntp.c_str());
+
+    ok &= SettingsStore::putBool(NvsMqtt, "enabled", d.mqttEnabled);
+    ok &= SettingsStore::putString(NvsMqtt, "host", d.mqttHost.c_str());
+    ok &= SettingsStore::putUInt(NvsMqtt, "port", d.mqttPort);
+    ok &= SettingsStore::putString(NvsMqtt, "user", d.mqttUser.c_str());
+    ok &= SettingsStore::putString(NvsMqtt, "base", d.mqttBase.c_str());
+    ok &= SettingsStore::putUInt(NvsMqtt, "interval", d.mqttInterval);
+    ok &= SettingsStore::putString(NvsMqtt, "client", d.mqttClient.c_str());
+
+    if (d.wifiSsid.empty())
+    {
+        SettingsStore::remove(NvsNet, "ssid");
+    }
+    else
+    {
+        ok &= SettingsStore::putString(NvsNet, "ssid", d.wifiSsid.c_str());
+    }
+    ok &= SettingsStore::putBool(NvsNet, "apalways", d.apAlways);
+    if (d.hostname.empty())
+    {
+        SettingsStore::remove(NvsNet, "host");
+    }
+    else
+    {
+        ok &= SettingsStore::putString(NvsNet, "host", d.hostname.c_str());
+    }
+    return ok;
+}
+
+/// Kurzfassung für die Vorschau: Liste [["Bereich","Inhalt"],...] als JSON.
+String backupSummaryJson(const BackupData& d)
+{
+    auto row = [](const String& k, const String& v) {
+        return "[" + WebUi::jsonString(k) + "," + WebUi::jsonString(v) + "]";
+    };
+    const LoadControllerConfig preset = d.balcony ? LoadControllerConfig::balcony()
+                                                  : LoadControllerConfig::camper();
+    String j = "[";
+    j += row("Gesichert", String(d.created.empty() ? "(ohne Datum)" : d.created.c_str()) +
+                          ", Firmware " + d.firmware.c_str());
+    j += "," + row("Anlage", d.balcony ? "Balkonkraftwerk" : "Camper");
+    for (size_t i = 0; i < RelayCount; ++i)
+    {
+        String v;
+        if (!preset.relays[i].enabled)      v = "deaktiviert";
+        else if (sameLimits(d.relays[i], RelayLimits::from(preset.relays[i])))
+                                            v = "Voreinstellung";
+        else
+        {
+            const RelayLimits& l = d.relays[i];
+            v = "Sperre " + String(l.lockBelowSoc, 1) + " %, Aus " + String(l.offBelowSoc, 1) +
+                " %, Frei " + String(l.releaseAtSoc, 1) + " %, Auszeit " + String(l.minOffTimeMs / 1000) +
+                " s, Start " + (l.startupRequest ? "ein" : "aus") + ", autom. " + (l.rememberRequest ? "ja" : "nein");
+            v.replace('.', ',');
+        }
+        j += "," + row("R" + String(i + 1) + " " + preset.relays[i].name, v);
+    }
+    j += "," + row("Uhr", String(Rtc::timeZone(d.tz.c_str()).label) + ", NTP " + d.ntp.c_str());
+    j += "," + row("MQTT", d.mqttEnabled ? String("ein, ") + d.mqttHost.c_str() + ":" + String(d.mqttPort) +
+                                               ", Topic " + d.mqttBase.c_str() + ", alle " + String(d.mqttInterval) + " s"
+                                         : String("aus"));
+    j += "," + row("WLAN", d.wifiSsid.empty() ? String("nicht eingerichtet")
+                                              : String(d.wifiSsid.c_str()) + (d.apAlways ? ", Access Point immer an" : ""));
+    j += "," + row("Passwörter", "bleiben unverändert (sind nicht in der Datei)");
+    return j + "]";
+}
+
+/// POST /api/backup/check und /restore: Datei prüfen (und ggf. übernehmen).
+int handleBackupUpload(const ApiRequest& req, String& out, bool restore)
+{
+    const String text = req.arg("data");
+    BackupData d;
+    std::string error;
+    if (!backupFromJson(text.c_str(), d, error))
+    {
+        out = "{\"ok\":false,\"error\":" + WebUi::jsonString(String(error.c_str())) + "}";
+        return 400;
+    }
+    if (!restore)
+    {
+        out = "{\"ok\":true,\"summary\":" + backupSummaryJson(d) + "}";
+        return 200;
+    }
+    const bool ok = applyBackup(d);
+    addEvent(ok ? Severity::Warning : Severity::Critical,
+             ok ? "Einstellungen aus Sicherung wiederhergestellt, Neustart (Befehl WebUI)"
+                : "Wiederherstellen: Speichern im Flash teilweise fehlgeschlagen");
+    g_webUi.requestRestart(1500);
+    out = "{\"ok\":" + String(ok ? "true" : "false") + ",\"result\":" +
+          WebUi::jsonString(ok ? "wiederhergestellt, Gerät startet neu"
+                               : "Speichern teilweise fehlgeschlagen, Gerät startet neu – Einstellungen prüfen") + "}";
+    return 200;
+}
+
+/******************************************************************************
  * W4b Schritt 4: HEX-Daten für die WebUI (MPPT-Historie; Einstellungen folgen)
  ******************************************************************************/
 HexRegisterCache g_webHexCache;   ///< Kopie für die webTask (~2 KB, nicht auf den Stack)
@@ -2539,6 +2808,17 @@ void registerProjectApi()
                        out = commandResponse(ok, result);
                        return 200;
                    });
+
+    // ---- W5: Sicherung / Wiederherstellung ----
+    g_webUi.addApi("/api/backup", WebUi::Method::Get,
+                   [](const ApiRequest&, String& out) {
+                       out = backupToJson(collectBackup()).c_str();
+                       return 200;
+                   });
+    g_webUi.addApi("/api/backup/check", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) { return handleBackupUpload(req, out, false); });
+    g_webUi.addApi("/api/backup/restore", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) { return handleBackupUpload(req, out, true); });
 
     // ---- W4e Schritt 3: Uhr ----
     g_webUi.addApi("/api/clock", WebUi::Method::Get,
@@ -3500,7 +3780,32 @@ bool g_showFrames = false;
 void printHelp()
 {
     Serial.println("[HILFE] Befehle: r1|r2|r3 ein|aus | override ein|aus | "
-                   "bloecke ein|aus | hex (Diagnose) | uhr | hilfe");
+                   "bloecke ein|aus | hex (Diagnose) | uhr | speicher | hilfe");
+}
+
+/// "speicher": Arbeitsspeicher und Stack-Reserve je Task (W5).
+/// Stack-Reserve = kleinster jemals freier Rest seit dem Start ("Hochwassermarke");
+/// unter ca. 1 KB wird es eng (Absturz durch Stack-Überlauf möglich).
+void printMemory()
+{
+    Serial.printf("[SPEICHER] Heap frei %lu Byte, kleinster Wert seit Start %lu Byte, "
+                  "größter freier Block %lu Byte\n",
+                  static_cast<unsigned long>(ESP.getFreeHeap()),
+                  static_cast<unsigned long>(ESP.getMinFreeHeap()),
+                  static_cast<unsigned long>(ESP.getMaxAllocHeap()));
+    for (const TaskInfo& t : g_tasks)
+    {
+        if (t.handle == nullptr)
+        {
+            continue;
+        }
+        // ESP-IDF: Rückgabe in Byte (Stackgröße wird dort in Byte angegeben)
+        const uint32_t freeMin = uxTaskGetStackHighWaterMark(t.handle);
+        Serial.printf("[SPEICHER] Task %-8s Stack %5lu Byte, Reserve min. %5lu Byte (%2lu %%)%s\n",
+                      t.name, static_cast<unsigned long>(t.stackBytes), static_cast<unsigned long>(freeMin),
+                      static_cast<unsigned long>(freeMin * 100 / t.stackBytes),
+                      freeMin < 1024 ? "  <-- KNAPP" : "");
+    }
 }
 
 /// "uhr" (anzeigen) bzw. "uhr stellen JJJJ-MM-TT hh:mm:ss" (UTC!). W4e Schritt 2.
@@ -3706,6 +4011,13 @@ void handleCommandLine(char* line)
     {
         g_showFrames = false;
         Serial.println("[AUSGABE] Blockausgabe AUS (nur Status, Ereignisse, Befehle)");
+        return;
+    }
+
+    // ---- W5: Speicher-Diagnose ----
+    if (std::strcmp(line, "speicher") == 0)
+    {
+        printMemory();
         return;
     }
 
@@ -4094,30 +4406,31 @@ void setup()
     esp_task_wdt_init(WatchdogTimeoutS, true);
 
     // Logger zuerst starten, damit er bereit ist, bevor Nachrichten kommen.
+    // Handles in g_tasks merken (W5: Monitor-Befehl "speicher")
     xTaskCreatePinnedToCore(loggerTask, "Logger", LoggerTaskStack,
-                            nullptr, LoggerTaskPriority, nullptr, 1);
+                            nullptr, LoggerTaskPriority, &g_tasks[0].handle, 1);
 
     // Systemauswertung (Stufe 4a), 1×/s
     xTaskCreatePinnedToCore(systemTask, "System", SystemTaskStack,
-                            nullptr, SystemTaskPriority, nullptr, 0);
+                            nullptr, SystemTaskPriority, &g_tasks[1].handle, 0);
 
     // E-Paper (Stufe 4c-2)
     xTaskCreatePinnedToCore(displayTask, "Display", DisplayTaskStack,
-                            nullptr, DisplayTaskPriority, nullptr, 1);
+                            nullptr, DisplayTaskPriority, &g_tasks[2].handle, 1);
 
     // WLAN + WebUI (Stufe W1)
     xTaskCreatePinnedToCore(webTask, "Web", WebTaskStack,
-                            nullptr, WebTaskPriority, nullptr, 0);
+                            nullptr, WebTaskPriority, &g_tasks[3].handle, 0);
 
     // MQTT (Stufe W3)
     xTaskCreatePinnedToCore(mqttTask, "Mqtt", MqttTaskStack,
-                            nullptr, MqttTaskPriority, nullptr, 0);
+                            nullptr, MqttTaskPriority, &g_tasks[4].handle, 0);
 
     // Je ein Kern pro UART-Kanal (wie bisher).
     xTaskCreatePinnedToCore(uartTask, "UART1", UartTaskStack,
-                            &g_channels[0], UartTaskPriority, nullptr, 0);
+                            &g_channels[0], UartTaskPriority, &g_tasks[5].handle, 0);
     xTaskCreatePinnedToCore(uartTask, "UART2", UartTaskStack,
-                            &g_channels[1], UartTaskPriority, nullptr, 1);
+                            &g_channels[1], UartTaskPriority, &g_tasks[6].handle, 1);
 }
 
 /******************************************************************************

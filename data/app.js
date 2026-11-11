@@ -144,6 +144,14 @@ async function refreshStatus() {
     if (s.mqtt) showMqttStatus(s.mqtt);
     $("stUptime").textContent = formatUptime(s.uptimeS);
     $("stHeap").textContent = Math.round(s.freeHeap / 1024) + " KB";
+    if (s.memory) {
+      // W5: kleinste Werte seit dem Start; unter der Warngrenze rot
+      const m = s.memory;
+      $("stHeapMin").textContent = Math.round(m.minFreeHeap / 1024) + " KB (kleinster Wert seit Start)";
+      $("stHeapMin").style.color = m.minFreeHeap < m.heapWarn ? "var(--danger)" : "";
+      $("stStackMin").textContent = m.minStack + " Byte (Task " + m.minStackTask + ")";
+      $("stStackMin").style.color = m.minStack < m.stackWarn ? "var(--danger)" : "";
+    }
     $("pwWarning").classList.toggle("hidden", !s.defaultPassword);
     showFaultSummary(s.faults);
     sendBrowserTimeIfNeeded(s.clock);
@@ -813,6 +821,66 @@ $("clockForm").addEventListener("submit", async (ev) => {
     showClock(r.clock);
   } catch (e) {
     toast("Uhr: " + e.message, true);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// W5: Sicherung / Wiederherstellung (System → Gerät)
+// ---------------------------------------------------------------------------
+$("bkDownload").addEventListener("click", async () => {
+  try {
+    const res = await fetch("/api/backup");
+    if (!res.ok) throw new Error("Fehler " + res.status);
+    const text = await res.text();
+    const d = new Date();
+    const name = "vedirect-einstellungen-" + d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") +
+      "-" + String(d.getDate()).padStart(2, "0") + ".json";
+    const url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("Gespeichert als " + name);
+  } catch (e) {
+    toast("Sicherung: " + e.message, true);
+  }
+});
+
+/// Gewählte Datei als Text lesen (für Prüfen und Wiederherstellen).
+function readBackupFile() {
+  const file = $("bkFile").files[0];
+  if (!file) return Promise.reject(new Error("Bitte zuerst eine Datei auswählen."));
+  if (file.size > 8192) return Promise.reject(new Error("Datei zu groß – das ist keine Sicherung dieses Geräts."));
+  return file.text();
+}
+
+$("bkFile").addEventListener("change", () => $("bkPreview").classList.add("hidden"));
+
+$("bkCheck").addEventListener("click", async () => {
+  $("bkPreview").classList.add("hidden");
+  try {
+    const r = await api("/api/backup/check", { data: await readBackupFile() });
+    $("bkSummary").innerHTML = grid(r.summary);
+    $("bkPreview").classList.remove("hidden");
+  } catch (e) {
+    toast("Sicherung: " + e.message, true);
+  }
+});
+
+$("bkRestore").addEventListener("click", async () => {
+  if (!confirm("Alle Einstellungen durch die Sicherung ersetzen?\n\n" +
+               "• Das Gerät startet danach neu, alle Relais fallen dabei kurz ab.\n" +
+               "• Passwörter bleiben unverändert.")) return;
+  try {
+    const r = await api("/api/backup/restore", { data: await readBackupFile() });
+    toast(r.result, !r.ok);
+    $("bkRestore").disabled = true;
+    setTimeout(() => location.reload(), 15000);
+  } catch (e) {
+    toast("Sicherung: " + e.message, true);
   }
 });
 

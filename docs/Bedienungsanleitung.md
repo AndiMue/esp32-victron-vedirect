@@ -1,6 +1,6 @@
 # Bedienungsanleitung – VE.Direct Steuergerät
 
-> **Stand:** 11.11.2026, Firmware und WebUI ab `26.11.11-1803`
+> **Stand:** 11.11.2026, Firmware und WebUI ab `26.11.11-1857`
 > **Status:** Entwurf, wächst mit jeder Entwicklungsstufe mit.
 > Abschnitte mit *„folgt“* sind noch nicht umgesetzt.
 
@@ -68,7 +68,7 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
 | **Historie** | Historienwerte von Shunt und MPPT (z. B. tiefste Entladung, Ertrag gesamt) und die **MPPT-Historie der letzten 30 Tage** (Kapitel 3.4) |
 | **Fehler** | aktive Fehler, Gerätemeldungen, letzter Neustart, Ereignisliste (Kapitel 3.3) |
 | **Einstellungen** | Unterreiter **Steuerung** (Relais-Schwellen und Anlage, Kapitel 7.4 und 7.5), **Shunt** und **MPPT** (Geräteeinstellungen, nur Anzeige, Kapitel 3.5) |
-| **System** | Unterreiter **Info** (Netzwerk, MQTT, Versionen, Uhrzeit, Laufzeit, freier Speicher), **WLAN** (Kapitel 4), **MQTT** (Kapitel 9), **Gerät** (Passwort Kapitel 5, Uhr Kapitel 3.6, Neustart), **Update** (Kapitel 8) |
+| **System** | Unterreiter **Info** (Netzwerk, MQTT, Versionen, Uhrzeit, Laufzeit, freier Speicher sowie kleinster freier Speicher und knappste Stack-Reserve seit Start – rot unter der Warngrenze), **WLAN** (Kapitel 4), **MQTT** (Kapitel 9), **Gerät** (Passwort Kapitel 5, Uhr Kapitel 3.6, Sicherung Kapitel 3.7, Neustart), **Update** (Kapitel 8) |
 
 ### 3.2 Anzeigen und Aktualisierung
 
@@ -94,6 +94,7 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
   - Fehler aufgetreten / behoben (erst ab 10 s nach dem Start, vorher werden die Geräte noch erkannt)
   - geänderte Relais-Einstellungen, Zurücksetzen auf Voreinstellung, Anlagenwechsel
   - Uhr per NTP gestellt bzw. vom Browser übernommen, geänderte Uhr-Einstellungen (Kapitel 3.6)
+  - Warnung „Arbeitsspeicher knapp“ (kleinster freier Wert seit Start unter 30 KB) bzw. „Stack der Task … knapp“ (unter 1 KB Reserve); wird 1× pro Minute geprüft und je Ursache nur einmal gemeldet
 - Die Ereignisliste liegt im Arbeitsspeicher und ist nach einem Neustart leer (bis auf den Start selbst).
 - Antwortet ein Victron-Gerät nicht auf Leseanfragen (Kapitel 3.4), steht dort die Info „Gerät antwortet nicht auf HEX-Anfragen“.
 - **Reaktionszeit:** Wird ein Gerät abgezogen, erscheint der Fehler nach ca. 5–7 s auf dem Display und nach ca. 5–8 s in der WebUI (je nach Aktualisierungstakt). Die Wartezeit von 5 s verhindert Fehlalarme bei einzelnen verlorenen Datenblöcken.
@@ -152,6 +153,25 @@ Angezeigt werden außerdem die aktuelle Uhrzeit, wie sie zuletzt gestellt wurde 
 **Knopfzelle:** Die Echtzeituhr braucht eine Knopfzelle **CR1220**. Ohne sie läuft die Uhr nur, solange das Gerät Strom hat. Nach einem Stromausfall ist die Zeit dann weg, bis sie neu gestellt wird (Internet bzw. Browser). Hinweis „Knopfzelle fehlt/schwach“ → Knopfzelle einsetzen bzw. tauschen.
 
 Intern läuft die Uhr in UTC; Zeitzone und Sommerzeit werden nur bei der Anzeige berücksichtigt. Genauigkeit der Echtzeituhr: etwa ±2 s pro Tag (wird per NTP täglich korrigiert).
+
+### 3.7 Sicherung und Wiederherstellung (System → Gerät)
+
+**Sichern:** **„Einstellungen herunterladen“** speichert eine Datei `vedirect-einstellungen-JJJJ-MM-TT.json` mit:
+- Anlage (Camper/Balkonkraftwerk) und den **wirksamen Werten aller Relais** (auch wenn sie der Voreinstellung entsprechen),
+- Uhr (Zeitzone, NTP-Server),
+- MQTT (Broker, Port, Benutzer, Basis-Topic, Intervall, Client-ID, ein/aus),
+- WLAN (Netzname, „Access Point immer an“, Gerätename im Netz).
+
+**Passwörter (WLAN, MQTT, Gerät) sind nie in der Datei.** Die Datei ist lesbarer Text und kann mit einem Editor angesehen und geändert werden, z. B. `"relay2.minOffS": 120`. Beim Wiederherstellen wird jeder Wert geprüft. Relais-Werte, die der Voreinstellung der Anlage entsprechen, gelten danach als „Voreinstellung“, abweichende als „geändert“.
+
+Der aktuelle **Schaltzustand** der Relais (ein/aus) ist keine Einstellung und wird nicht gesichert; nach dem Neustart gilt „Zustand nach Neustart“ (`relayN.startup`).
+
+**Wiederherstellen:**
+1. Datei auswählen, **„Datei prüfen“**. Das Gerät prüft alle Werte und zeigt eine Vorschau. Eine fehlerhafte oder fremde Datei wird mit Grund abgelehnt – es wird nichts übernommen.
+2. **„Wiederherstellen und neu starten“**: Es werden **immer alle** Einstellungen ersetzt. Das Gerät startet neu, die Relais fallen dabei kurz ab.
+3. Die **Passwörter bleiben**, wie sie auf dem Gerät gespeichert sind. Auf einem neuen oder zurückgesetzten Gerät müssen WLAN- und MQTT-Passwort danach neu eingegeben werden (bis dahin ist das Gerät über seinen Access Point erreichbar).
+
+Eine Sicherung aus einer neueren Firmware wird abgelehnt (erst die Firmware aktualisieren).
 
 ---
 
@@ -468,6 +488,12 @@ Einstellungen (WLAN, Passwort, MQTT, Relais, Anlage) bleiben dabei erhalten; sie
 
 **Verbindung:** ESP32 per USB an den PC, serieller Monitor mit **115200 Baud** (VS Code: PlatformIO → *Monitor*). Befehl eintippen und mit Enter abschicken. Groß-/Kleinschreibung ist egal. Unbekannte Eingaben zeigen die Hilfe.
 
+**Langzeitlauf ohne Zuschauer:** Ausgabe mit Uhrzeit in eine Datei schreiben (PlatformIO-Terminal):
+```
+pio device monitor -f time -f log2file
+```
+Die Logdatei landet im Projektordner und enthält auch die letzten Zeilen vor einem Absturz.
+
 Alle 5 s erscheinen Statuszeilen: `[STATUS]` je Anschluss (Gerät, Zähler, Verbindung), `[SYSTEM]` (Batterie, PV, Fehlerwort), `[RELAIS]`, `[WLAN]`. Ereignisse (Gerät erkannt/verloren, Befehle, Fehler) erscheinen sofort.
 
 #### Relais und Override
@@ -484,6 +510,7 @@ Befehle aus dem Monitor zählen als Quelle **„lokal“** (wie später Taster/T
 | Befehl | Wirkung |
 |---|---|
 | `bloecke ein` / `bloecke aus` | jeden empfangenen VE.Direct-Textblock vollständig ausgeben (Klarname + Rohwert). Standard: aus |
+| `speicher` | Arbeitsspeicher (frei, kleinster Wert seit Start, größter Block) und Stack-Reserve je Task; unter ca. 1 KB Reserve wird „KNAPP“ markiert |
 | `hilfe` | Befehlsübersicht |
 
 #### HEX-Protokoll (W4b, nur lesend)

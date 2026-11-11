@@ -248,6 +248,8 @@
           <dt>Uhrzeit</dt>        <dd id="stClock">–</dd>
           <dt>Laufzeit</dt>       <dd id="stUptime">–</dd>
           <dt>Freier Speicher</dt><dd id="stHeap">–</dd>
+          <dt>Speicher min.</dt>  <dd id="stHeapMin">–</dd>
+          <dt>Stack-Reserve min.</dt><dd id="stStackMin">–</dd>
         </dl>
       </div>
 
@@ -371,6 +373,21 @@
         </form>
         <p class="hint">Die Uhr stellt sich selbst: per NTP, sobald das Gerät Internet hat (danach einmal täglich),
           sonst aus der Echtzeituhr. Hat das Gerät gar keine gültige Zeit, übernimmt es die Uhrzeit dieses Browsers.</p>
+
+        <h2>Sicherung</h2>
+        <p>Speichert alle wirksamen Einstellungen (Anlage, alle Relais-Werte, Uhr, MQTT, WLAN-Name) in einer Datei.
+          <b>Passwörter sind nicht enthalten</b> und bleiben beim Wiederherstellen auf dem Gerät erhalten.
+          Die Datei ist lesbarer Text; Werte können darin auch geändert werden (sie werden beim Wiederherstellen geprüft).</p>
+        <button id="bkDownload" class="secondary">Einstellungen herunterladen</button>
+
+        <h2>Wiederherstellen</h2>
+        <input type="file" id="bkFile" accept=".json,application/json">
+        <button id="bkCheck" class="secondary">Datei prüfen</button>
+        <div id="bkPreview" class="hidden">
+          <p><b>Inhalt der Datei.</b> „Wiederherstellen“ übernimmt alle diese Einstellungen und ersetzt damit die aktuellen:</p>
+          <dl class="grid" id="bkSummary"></dl>
+          <button id="bkRestore" class="danger">Wiederherstellen und neu starten</button>
+        </div>
 
         <h2>Neustart</h2>
         <button id="restartBtn" class="secondary">Gerät neu starten</button>
