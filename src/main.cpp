@@ -61,11 +61,14 @@
 #include "DeviceState.hpp"
 #include "LinkMonitor.hpp"
 #include "EventLog.hpp"
+#include "FieldCatalog.hpp"
 #include "LoadController.hpp"
 #include "SystemState.hpp"
 #include "ValueConverter.hpp"
 #include "ValueFormatter.hpp"
 #include "VeDirectFrame.hpp"
+#include "VeDirectHex.hpp"
+#include "VeDirectHexReader.hpp"
 #include "VeDirectReader.hpp"
 #include "VeDirectTextParser.hpp"
 
@@ -148,6 +151,10 @@ struct ChannelStatus
     bool     hasValidFrame    = false;        ///< mindestens ein gültiger Block?
     uint32_t queueDrops       = 0;            ///< Nachrichten verloren (Queue voll)
     bool     linkUnstable     = false;        ///< LinkMonitor: Verbindung instabil?
+    VeHex::VeDirectHexParser::Statistics hex; ///< W4b: HEX-Empfang
+    uint32_t hexRequests      = 0;            ///< W4b: gesendete HEX-Anfragen
+    HexJobRunner::Result hexJob;              ///< W4b: letzte/laufende automatische Abfrage
+    bool     hexBusy          = false;        ///< W4b: Abfrage läuft gerade
 };
 
 /******************************************************************************
@@ -160,7 +167,11 @@ enum class LogKind : uint8_t
     FrameDiscarded,   ///< Block mit Format-/Größenfehler verworfen
     DeviceIdentified, ///< Gerät erkannt (erstmals oder nach Ausfall)
     DeviceChanged,    ///< anderes Gerät am Kanal ("previousDevice" = altes)
-    DeviceLost        ///< Timeout ("previousDevice" = verlorenes Gerät)
+    DeviceLost,       ///< Timeout ("previousDevice" = verlorenes Gerät)
+    HexSent,          ///< W4b: HEX-Anfrage gesendet ("hexRequest")
+    HexMessage,       ///< W4b: gültige HEX-Nachricht ("hex")
+    HexError,         ///< W4b: HEX-Zeile mit Prüfsummen- oder Formatfehler
+    HexJobDone        ///< W4b: automatische Abfrage beendet (status.hexJob)
 };
 
 struct LogMessage
@@ -172,6 +183,9 @@ struct LogMessage
     DeviceDetector::Origin   origin = DeviceDetector::Origin::Unassigned;
     DeviceDetector::Identity previousDevice;  ///< nur bei DeviceChanged/DeviceLost
     VeDirectFrame            frame;           ///< nur bei LogKind::Frame gültig
+    VeHex::Message           hex;             ///< W4b: nur bei LogKind::HexMessage
+    VeHex::Request           hexRequest;      ///< W4b: nur bei LogKind::HexSent
+    int32_t                  hexAfterMs = -1; ///< W4b: Zeit seit der letzten Anfrage (-1 = keine)
 };
 
 /******************************************************************************
@@ -193,6 +207,22 @@ struct Channel
     ChannelStatus       status;     ///< geschützt durch g_statusLock
     LogMessage          outgoing;   ///< Sendepuffer der UART-Task
                                     ///< (global statt auf dem Stack, ~1,8 KB)
+
+    // ---- W4b: HEX-Protokoll (nur lesen) ----
+    VeHex::VeDirectHexParser hexParser;     ///< nur von der eigenen UART-Task benutzt
+    VeHex::Request      hexPending;         ///< nächste Anfrage, geschützt durch g_statusLock
+    bool                hexPendingSet = false;   ///< geschützt durch g_statusLock
+    uint32_t            hexSentMs     = 0;  ///< nur UART-Task
+    bool                hexSent       = false;   ///< nur UART-Task
+
+    // ---- W4b Schritt 3: automatische Abfragen ----
+    HexRegisterCache    hexCache;                ///< Antworten, geschützt durch stateMutex (~2 KB)
+    HexJobRunner        hexJob;                  ///< nur UART-Task
+    bool                hexAutoPending = false;  ///< nur UART-Task: nach Erkennung lesen
+    uint32_t            hexAutoAtMs   = 0;       ///< nur UART-Task: frühester Zeitpunkt dafür
+    bool                hexRefreshRequested = false;   ///< geschützt durch g_statusLock
+    uint32_t            hexLastRxMs   = 0;       ///< nur UART-Task: letzte gültige HEX-Nachricht
+    uint32_t            hexJobEndMs   = 0;       ///< nur UART-Task
 
     // ---- Stufe 4a: geschützt durch stateMutex ----
     DeviceState         deviceState;            ///< Werte des Geräts (~5 KB)
@@ -428,6 +458,9 @@ void publish(Channel& channel, LogKind kind, uint32_t now,
     channel.status.device   = channel.detector.identity();
     channel.status.detector = channel.detector.statistics();
     channel.status.linkUnstable = channel.link.isUnstable();   // eigene Task -> Lesen ohne Mutex ok
+    channel.status.hex      = channel.hexParser.statistics();
+    channel.status.hexJob   = channel.hexJob.result();
+    channel.status.hexBusy  = channel.hexJob.busy();
     if (kind == LogKind::Frame)
     {
         channel.status.lastValidFrameMs = now;
@@ -483,18 +516,202 @@ void publish(Channel& channel, LogKind kind, uint32_t now,
     }
 }
 
+/******************************************************************************
+ * W4b: HEX-Protokoll (nur lesen) in der UART-Task
+ ******************************************************************************/
+/// HEX-Ereignis an den Logger melden (Nachricht, Fehler oder gesendete Anfrage).
+void publishHex(Channel& channel, LogKind kind, uint32_t now)
+{
+    channel.outgoing.hexAfterMs = channel.hexSent
+        ? static_cast<int32_t>(now - channel.hexSentMs) : -1;
+    if (kind == LogKind::HexMessage)
+    {
+        channel.outgoing.hex = channel.hexParser.message();
+    }
+    publish(channel, kind, now);
+}
+
+/// Wartende HEX-Anfrage (von einer anderen Task hinterlegt) senden.
+void sendPendingHex(Channel& channel)
+{
+    bool pending = false;
+    portENTER_CRITICAL(&g_statusLock);
+    if (channel.hexPendingSet)
+    {
+        channel.outgoing.hexRequest = channel.hexPending;
+        channel.hexPendingSet = false;
+        ++channel.status.hexRequests;
+        pending = true;
+    }
+    portEXIT_CRITICAL(&g_statusLock);
+
+    if (!pending)
+    {
+        return;
+    }
+    const VeHex::Request& r = channel.outgoing.hexRequest;
+    channel.reader.write(r.text, r.length);
+    const uint32_t now = millis();
+    channel.hexSentMs = now;
+    channel.hexSent   = true;
+    publish(channel, LogKind::HexSent, now);
+}
+
+/// HEX-Anfrage für einen Kanal hinterlegen (aus beliebiger Task).
+/// Die UART-Task sendet sie beim nächsten Durchlauf. Eine noch nicht
+/// gesendete Anfrage wird ersetzt.
+void requestHex(size_t channelIndex, const VeHex::Request& request)
+{
+    Channel& channel = g_channels[channelIndex];
+    portENTER_CRITICAL(&g_statusLock);
+    channel.hexPending    = request;
+    channel.hexPendingSet = true;
+    portEXIT_CRITICAL(&g_statusLock);
+}
+
+/// HEX-Register neu lesen lassen (aus beliebiger Task, z. B. WebUI-Reiter,
+/// Knopf, serieller Monitor). Die UART-Task startet die Abfrage, sobald das
+/// Gerät erkannt ist und keine andere Abfrage läuft.
+void requestHexRefresh(size_t channelIndex)
+{
+    Channel& channel = g_channels[channelIndex];
+    portENTER_CRITICAL(&g_statusLock);
+    channel.hexRefreshRequested = true;
+    portEXIT_CRITICAL(&g_statusLock);
+}
+
+/// W4b: Nach einer Abfrage noch so lange einen Ausfall nicht melden, wenn
+/// das Gerät auf HEX antwortet (ältere MPPT-Firmware < 1.53 kann die
+/// Textblöcke während HEX-Verkehr verzögern; Shunt FW 4.20: keine Pause).
+constexpr uint32_t HexGraceMs      = 3000;
+constexpr uint32_t HexAliveMs      = 2000;   ///< "antwortet": letzte HEX-Nachricht so jung
+
+/// Automatische Abfrage erst so lange nach dem Erkennen starten.
+/// Finding 11.11.2026: Direkt nach dem Erkennen lieferte der SmartShunt
+/// (FW 4.20) für 0x1001 (Ladespannung) zweimal 0 statt 140 (14,0 V); später
+/// gelesen stimmte der Wert. Ursache am Gerät unklar, Abhilfe: kurz warten.
+constexpr uint32_t HexAutoDelayMs  = 5000;
+
 /// Geräteausfall prüfen und ggf. melden.
 void checkDeviceTimeout(Channel& channel, uint32_t now)
 {
+    // Gerät beantwortet gerade HEX-Anfragen -> es ist da, auch wenn die
+    // Textblöcke kurz pausieren. Gilt nur während/kurz nach einer Abfrage.
+    const bool hexPhase = channel.hexJob.busy() ||
+                          static_cast<uint32_t>(now - channel.hexJobEndMs) < HexGraceMs;
+    const bool hexAlive = channel.hexLastRxMs != 0 &&
+                          static_cast<uint32_t>(now - channel.hexLastRxMs) < HexAliveMs;
+    if (hexPhase && hexAlive)
+    {
+        return;
+    }
+
     if (channel.detector.checkTimeout(now) == DeviceDetector::Event::Lost)
     {
+        channel.hexJob.cancel();   // Abfrage für ein verlorenes Gerät beenden
         {
             StateLock lock(channel.stateMutex);
             channel.link.recordOutage(now);
             channel.deviceState.clear();   // "--" statt veralteter Werte
             channel.deviceState.setIdentity(channel.detector.identity());
+            channel.hexCache.clear();      // Einstellungen/Historie gehören zum alten Gerät
         }
         publish(channel, LogKind::DeviceLost, now);
+    }
+}
+
+/// Automatische Abfrage starten, wenn fällig (nach Erkennung oder auf Anforderung).
+void startHexJobIfDue(Channel& channel, uint32_t now)
+{
+    bool requested = false;
+    portENTER_CRITICAL(&g_statusLock);
+    requested = channel.hexRefreshRequested;
+    portEXIT_CRITICAL(&g_statusLock);
+
+    const bool autoDue = channel.hexAutoPending &&
+                         static_cast<int32_t>(now - channel.hexAutoAtMs) >= 0;
+    if (!(requested || autoDue) || channel.hexJob.busy())
+    {
+        return;
+    }
+    const DeviceDetector::Identity& id = channel.detector.identity();
+    if (id.state != DeviceDetector::State::Identified || id.device == nullptr)
+    {
+        return;   // warten, bis das Gerät erkannt ist (Anforderung bleibt stehen)
+    }
+
+    std::size_t count = 0;
+    const uint16_t* regs = nullptr;
+    if (id.device->category == DeviceCategory::BatteryMonitor) regs = HexJobs::shunt(count);
+    else if (id.device->category == DeviceCategory::Mppt)      regs = HexJobs::mppt(count);
+
+    const bool started = regs != nullptr && channel.hexJob.start(regs, count, now);
+
+    // Anforderung erledigt; "läuft" sofort sichtbar machen (die WebUI fragt
+    // "angefordert || läuft" ab und darf dazwischen keine Lücke sehen)
+    portENTER_CRITICAL(&g_statusLock);
+    channel.hexRefreshRequested = false;
+    channel.status.hexBusy      = started;
+    portEXIT_CRITICAL(&g_statusLock);
+    channel.hexAutoPending = false;
+}
+
+/// Laufende Abfrage weiterführen: nächste Anfrage senden, Ende melden.
+void pollHexJob(Channel& channel, uint32_t now)
+{
+    VeHex::Request request;
+    bool send = false;
+    {
+        StateLock lock(channel.stateMutex);   // poll() kann den Cache ändern (keine Antwort)
+        send = channel.hexJob.poll(now, request, channel.hexCache);
+    }
+    if (send)
+    {
+        channel.reader.write(request.text, request.length);
+        portENTER_CRITICAL(&g_statusLock);
+        ++channel.status.hexRequests;
+        portEXIT_CRITICAL(&g_statusLock);
+    }
+
+    if (channel.hexJob.finishedNow())
+    {
+        channel.hexJobEndMs = now;
+        const HexJobRunner::Result& r = channel.hexJob.result();
+        if (r.aborted)
+        {
+            addEvent(Severity::Info, "%s: Gerät antwortet nicht auf HEX-Anfragen "
+                     "(Einstellungen/Historie nicht verfügbar)", channel.name);
+        }
+        else if (r.failed > 0)
+        {
+            addEvent(Severity::Info, "%s: HEX-Abfrage, %u von %u Werten ohne Antwort", channel.name,
+                     static_cast<unsigned>(r.failed), static_cast<unsigned>(r.requested));
+        }
+        publish(channel, LogKind::HexJobDone, now);
+    }
+}
+
+/// Gültige HEX-Nachricht verarbeiten: Antwort der Abfrage, ungefragte
+/// Meldung (aktualisiert bekannte Register) oder Diagnose-Antwort (Monitor).
+void handleHexMessage(Channel& channel, uint32_t now)
+{
+    const VeHex::Message& m = channel.hexParser.message();
+    channel.hexLastRxMs = now;
+
+    bool consumed = false;
+    {
+        StateLock lock(channel.stateMutex);
+        consumed = channel.hexJob.onMessage(m, now, channel.hexCache);
+        if (!consumed)
+        {
+            channel.hexCache.store(m, now, true);
+        }
+    }
+    if (!consumed)
+    {
+        // Antworten der automatischen Abfrage nicht einzeln ausgeben (bis zu
+        // 39 Zeilen), nur Diagnose-Antworten und ungefragte Meldungen.
+        publishHex(channel, LogKind::HexMessage, now);
     }
 }
 
@@ -550,9 +767,28 @@ void uartTask(void* parameter)
                                 channel.detector.identity().state == DeviceDetector::State::Identified);
         }
 
+        // W4b: hinterlegte Diagnose-Anfrage senden, automatische Abfrage
+        // starten/weiterführen (nur lesende Befehle)
+        sendPendingHex(channel);
+        startHexJobIfDue(channel, millis());
+        pollHexJob(channel, millis());
+
         while (channel.reader.available())
         {
             const uint8_t byte = static_cast<uint8_t>(channel.reader.read());
+
+            // W4b: Dieselben Bytes auch auf HEX-Nachrichten prüfen (":…\n").
+            // Der Text-Parser überspringt diese Zeilen selbst.
+            const VeHex::VeDirectHexParser::Event hexEvent = channel.hexParser.process(byte);
+            if (hexEvent == VeHex::VeDirectHexParser::Event::MessageReady)
+            {
+                handleHexMessage(channel, millis());
+            }
+            else if (hexEvent != VeHex::VeDirectHexParser::Event::None)
+            {
+                publishHex(channel, LogKind::HexError, millis());
+            }
+
             const VeDirectTextParser::Event event = channel.parser.parse(byte);
 
             if (event == VeDirectTextParser::Event::None)
@@ -575,10 +811,19 @@ void uartTask(void* parameter)
                     if (result.event == DeviceDetector::Event::Identified)
                     {
                         publish(channel, LogKind::DeviceIdentified, now);
+                        channel.hexAutoPending = true;   // W4b: einmal nach Erkennung lesen
+                        channel.hexAutoAtMs    = now + HexAutoDelayMs;
                     }
                     else if (result.event == DeviceDetector::Event::Changed)
                     {
                         publish(channel, LogKind::DeviceChanged, now);
+                        channel.hexJob.cancel();
+                        {
+                            StateLock lock(channel.stateMutex);
+                            channel.hexCache.clear();   // Werte des alten Geräts verwerfen
+                        }
+                        channel.hexAutoPending = true;
+                        channel.hexAutoAtMs    = now + HexAutoDelayMs;
                     }
 
                     applyFrame(channel, frame, result, now);
@@ -1686,6 +1931,303 @@ int handleRelaySettings(const ApiRequest& req, String& out)
     return 200;
 }
 
+/******************************************************************************
+ * W4b Schritt 4: HEX-Daten für die WebUI (MPPT-Historie; Einstellungen folgen)
+ ******************************************************************************/
+HexRegisterCache g_webHexCache;   ///< Kopie für die webTask (~2 KB, nicht auf den Stack)
+
+/// Kanal zu einer Rolle ("shunt"/"mppt"), -1 = Gerät nicht vorhanden.
+int roleChannel(bool shunt)
+{
+    const SystemState state = readSystemState();
+    const int index = shunt ? state.batteryChannel : state.pvChannel;
+    return (index >= 0 && index < static_cast<int>(ChannelCount)) ? index : -1;
+}
+
+const char* hexStateKey(const HexRegisterCache::Entry* e)
+{
+    if (e == nullptr) return "missing";   // (noch) nicht gelesen
+    switch (e->state)
+    {
+        case HexRegisterCache::State::Ok:       return "ok";
+        case HexRegisterCache::State::NoData:   return "nodata";
+        case HexRegisterCache::State::Unknown:  return "unknown";
+        case HexRegisterCache::State::NoAnswer: return "noanswer";
+    }
+    return "missing";
+}
+
+/// Zahl mit Nachkommastellen als JSON (Rohwert / divisor).
+String jsonScaled(uint32_t raw, float divisor, unsigned decimals)
+{
+    return String(raw / divisor, decimals);
+}
+
+/// MPPT-Fehlercodes (jüngster zuerst) als Textliste, 0 = kein Fehler -> weglassen.
+String jsonErrorList(const uint8_t errors[4])
+{
+    static const FieldDefinition* err = FieldCatalog::find("ERR");
+    String j = "[";
+    bool first = true;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (errors[i] == 0) continue;
+        const char* text = err ? FieldCatalog::codeText(*err, errors[i]) : nullptr;
+        if (!first) j += ",";
+        first = false;
+        j += WebUi::jsonString(text ? String(text) + " (" + errors[i] + ")"
+                                    : "Fehler " + String(errors[i]));
+    }
+    return j + "]";
+}
+
+/// MPPT-Historie aus dem Zwischenspeicher (g_webHexCache) als JSON.
+String buildHistoryJson()
+{
+    String j;
+    j.reserve(9000);
+
+    // Gesamt
+    const HexRegisterCache::Entry* t = g_webHexCache.find(VeHex::RegHistoryTotal);
+    VeHex::HistoryTotal total;
+    const bool totalOk = t && t->state == HexRegisterCache::State::Ok &&
+                         VeHex::decodeHistoryTotal(t->value, t->length, total);
+    j += "{\"total\":{\"state\":\"" + String(totalOk ? "ok" : hexStateKey(t)) + "\"";
+    if (totalOk)
+    {
+        j += ",\"userYieldKWh\":"   + jsonScaled(total.userYieldWh, 1000.0f, 2);
+        j += ",\"systemYieldKWh\":" + jsonScaled(total.systemYieldWh, 1000.0f, 2);
+        j += ",\"panelMaxV\":"      + jsonScaled(total.panelMaxCentiV, 100.0f, 2);
+        j += ",\"batteryMaxV\":"    + jsonScaled(total.batteryMaxCentiV, 100.0f, 2);
+        j += ",\"batteryMinV\":"    + (total.batteryMinValid ? jsonScaled(total.batteryMinCentiV, 100.0f, 2)
+                                                             : String("null"));
+        j += ",\"daysAvailable\":"  + String(total.daysAvailable);
+        j += ",\"errors\":"         + jsonErrorList(total.errors);
+    }
+    j += "},\"days\":[";
+
+    // Tage: 0 = heute, 1 = gestern, ...
+    for (uint8_t ago = 0; ago < VeHex::HistoryDays; ++ago)
+    {
+        const HexRegisterCache::Entry* e = g_webHexCache.find(VeHex::RegHistoryToday + ago);
+        VeHex::HistoryDay d;
+        bool ok = false;
+        if (e && (e->state == HexRegisterCache::State::Ok || e->state == HexRegisterCache::State::NoData))
+        {
+            ok = VeHex::decodeHistoryDay(e->value, e->length, e->flags, d);
+        }
+        if (ago > 0) j += ",";
+        j += "{\"ago\":" + String(ago);
+        if (!ok || !d.valid)
+        {
+            j += ",\"state\":\"" + String(ok ? "nodata" : hexStateKey(e)) + "\"}";
+            continue;
+        }
+        j += ",\"state\":\"ok\"";
+        j += ",\"yieldKWh\":"      + jsonScaled(d.yieldWh, 1000.0f, 2);
+        j += ",\"consumedKWh\":"   + (d.consumedValid ? jsonScaled(d.consumedWh, 1000.0f, 2) : String("null"));
+        j += ",\"batteryMaxV\":"   + jsonScaled(d.batteryMaxCentiV, 100.0f, 2);
+        j += ",\"batteryMinV\":"   + jsonScaled(d.batteryMinCentiV, 100.0f, 2);
+        j += ",\"bulkMin\":"       + String(d.bulkMin);
+        j += ",\"absorptionMin\":" + String(d.absorptionMin);
+        j += ",\"floatMin\":"      + String(d.floatMin);
+        j += ",\"powerMaxW\":"     + String(d.powerMaxW);
+        j += ",\"currentMaxA\":"   + jsonScaled(d.batteryCurrentMaxDeciA, 10.0f, 1);
+        j += ",\"panelMaxV\":"     + jsonScaled(d.panelMaxCentiV, 100.0f, 2);
+        j += ",\"errors\":"        + jsonErrorList(d.errors);
+        j += "}";
+    }
+    j += "]}";
+    return j;
+}
+
+/******************************************************************************
+ * W4b Schritt 5: Geräteeinstellungen (nur lesen) – Anzeige
+ *
+ * Namen beim Shunt wie in VictronConnect (Projektinhaber 11.11.2026).
+ * Umrechnung laut Victron-HEX-Doku; Shunt-Werte am 11.11.2026 mit
+ * VictronConnect verglichen (alle passend).
+ ******************************************************************************/
+enum class HexFormat : uint8_t
+{
+    Number,          ///< Rohwert / divisor, decimals Nachkommastellen
+    BatteryVoltage,  ///< MPPT 0xEDEF: 0 = automatisch, sonst Volt
+    BatteryType,     ///< MPPT 0xEDF1: Code -> Text
+    LoadOutput       ///< MPPT 0xEDAB: Code (untere 4 Bit) -> Text
+};
+
+struct HexSetting
+{
+    uint16_t    reg;
+    const char* name;
+    HexFormat   format;
+    float       divisor;
+    uint8_t     decimals;
+    bool        isSigned;
+    const char* unit;
+};
+
+const HexSetting ShuntSettings[] =
+{
+    { 0x1000, "Batteriekapazität",                  HexFormat::Number, 1,   0, false, "Ah"   },
+    { 0x1001, "Spannung wenn aufgeladen",           HexFormat::Number, 10,  1, false, "V"    },
+    { 0x1002, "Schweifstrom",                       HexFormat::Number, 10,  1, false, "%"    },
+    { 0x1003, "Zeit für Ladezustandserkennung",     HexFormat::Number, 1,   0, false, "min"  },
+    { 0x1004, "Ladewirkungsgrad",                   HexFormat::Number, 1,   0, false, "%"    },
+    { 0x1005, "Peukert-Exponent",                   HexFormat::Number, 100, 2, false, ""     },
+    { 0x1006, "Strom-Schwellwert",                  HexFormat::Number, 100, 2, false, "A"    },
+    { 0x1007, "Durchschnittliche Restlaufzeit",     HexFormat::Number, 1,   0, false, "min"  },
+    { 0x1008, "Entladungsboden",                    HexFormat::Number, 10,  1, false, "%"    },
+};
+
+const HexSetting MpptSettings[] =
+{
+    { 0xEDEF, "Batteriespannung",                   HexFormat::BatteryVoltage, 1, 0, false, "V" },
+    { 0xEDF7, "Absorptionsspannung",                HexFormat::Number, 100, 2, false, "V"    },
+    { 0xEDF6, "Erhaltungsspannung",                 HexFormat::Number, 100, 2, false, "V"    },
+    { 0xEDF0, "Max. Ladestrom",                     HexFormat::Number, 10,  1, false, "A"    },
+    { 0xEDF1, "Batterietyp",                        HexFormat::BatteryType, 1, 0, false, ""  },
+    { 0xEDF2, "Temperaturkompensation",             HexFormat::Number, 100, 2, true,  "mV/K" },
+    { 0xEDAB, "Lastausgang",                        HexFormat::LoadOutput, 1, 0, false, ""   },
+};
+
+/// Batterietyp (MPPT mit Drehschalter, z. B. 100/50). Die Victron-Doku
+/// (Rev 18) nummeriert hier nicht eindeutig -> Code immer mit anzeigen.
+const char* batteryTypeText(uint32_t code)
+{
+    switch (code)
+    {
+        case 1:   return "GEL Victron Long Life (14,1 V)";
+        case 2:   return "GEL Victron Deep Discharge (14,3 V)";
+        case 3:   return "GEL Victron Deep Discharge (14,4 V)";
+        case 4:   return "AGM Victron Deep Discharge (14,7 V)";
+        case 5:   return "Röhrenplatte, Zyklus 1 (14,9 V)";
+        case 6:   return "Röhrenplatte, Zyklus 2 (15,1 V)";
+        case 7:   return "Röhrenplatte, Zyklus 3 (15,3 V)";
+        case 8:   return "LiFePO4 (14,2 V)";
+        case 255: return "benutzerdefiniert";
+    }
+    return nullptr;
+}
+
+const char* loadOutputText(uint32_t code)
+{
+    switch (code & 0x0F)
+    {
+        case 0: return "aus";
+        case 1: return "automatisch (BatteryLife)";
+        case 2: return "Alternative 1 (aus < 11,1 V, ein > 13,1 V)";
+        case 3: return "Alternative 2 (aus < 11,8 V, ein > 14,0 V)";
+        case 4: return "immer ein (ohne Entladeschutz)";
+        case 5: return "benutzerdefiniert 1";
+        case 6: return "benutzerdefiniert 2";
+        case 7: return "Automatic Energy Selector";
+    }
+    return nullptr;
+}
+
+/// Wert eines Registers als Anzeigetext (Dezimalkomma).
+String formatHexSetting(const HexSetting& s, const HexRegisterCache::Entry& e)
+{
+    const uint32_t raw = VeHex::readUnsigned(e.value, e.length);
+    switch (s.format)
+    {
+        case HexFormat::BatteryVoltage:
+            return raw == 0 ? String("automatisch") : String(raw) + " V";
+        case HexFormat::BatteryType:
+        {
+            const char* t = batteryTypeText(raw);
+            return t ? String(t) + " (Typ " + String(raw) + ")" : "Typ " + String(raw);
+        }
+        case HexFormat::LoadOutput:
+        {
+            const char* t = loadOutputText(raw);
+            return t ? String(t) : "Code " + String(raw);
+        }
+        case HexFormat::Number:
+        default:
+        {
+            const float v = (s.isSigned ? static_cast<float>(VeHex::readSigned(e.value, e.length))
+                                        : static_cast<float>(raw)) / s.divisor;
+            String text = String(v, static_cast<unsigned int>(s.decimals));
+            text.replace('.', ',');
+            return s.unit[0] ? text + " " + s.unit : text;
+        }
+    }
+}
+
+/// Einstellungen als JSON-Liste [{name, value, state}] aus g_webHexCache.
+/// Register, die das Gerät nicht kennt (z. B. Lastausgang ohne Lastausgang),
+/// werden weggelassen.
+String buildSettingsListJson(bool shunt)
+{
+    const HexSetting* list  = shunt ? ShuntSettings : MpptSettings;
+    const size_t      count = shunt ? sizeof(ShuntSettings) / sizeof(ShuntSettings[0])
+                                    : sizeof(MpptSettings) / sizeof(MpptSettings[0]);
+    String j = "[";
+    bool first = true;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const HexRegisterCache::Entry* e = g_webHexCache.find(list[i].reg);
+        if (e != nullptr && e->state == HexRegisterCache::State::Unknown)
+        {
+            continue;
+        }
+        const bool ok = e != nullptr && e->state == HexRegisterCache::State::Ok && e->length > 0;
+        if (!first) j += ",";
+        first = false;
+        j += "{\"name\":" + WebUi::jsonString(list[i].name);
+        j += ",\"state\":\"" + String(ok ? "ok" : hexStateKey(e)) + "\"";
+        j += ",\"value\":" + (ok ? WebUi::jsonString(formatHexSetting(list[i], *e)) : String("null"));
+        j += "}";
+    }
+    return j + "]";
+}
+
+/// GET /api/hex?role=shunt|mppt: Zustand der Abfrage + gelesene Daten.
+String buildHexJson(bool shunt)
+{
+    const int index = roleChannel(shunt);
+    if (index < 0)
+    {
+        return "{\"present\":false}";
+    }
+    Channel& channel = g_channels[index];
+    {
+        StateLock lock(channel.stateMutex);
+        g_webHexCache = channel.hexCache;
+    }
+    bool pending = false;
+    portENTER_CRITICAL(&g_statusLock);
+    pending = channel.hexRefreshRequested;
+    const ChannelStatus status = channel.status;
+    portEXIT_CRITICAL(&g_statusLock);
+    const uint32_t now = millis();
+
+    const HexJobRunner::Result& r = status.hexJob;
+    String j;
+    j.reserve(9500);
+    j  = "{\"present\":true";
+    j += ",\"uart\":"     + WebUi::jsonString(channel.name);
+    j += ",\"device\":"   + WebUi::jsonString(status.device.device ? status.device.device->name : "unbekanntes Gerät");
+    j += ",\"pending\":"  + String(pending ? "true" : "false");
+    j += ",\"busy\":"     + String(status.hexBusy ? "true" : "false");
+    j += ",\"job\":{\"finished\":" + String(r.finished ? "true" : "false");
+    j += ",\"aborted\":"   + String(r.aborted ? "true" : "false");
+    j += ",\"requested\":" + String(r.requested);
+    j += ",\"answered\":"  + String(r.answered);
+    j += ",\"failed\":"    + String(r.failed);
+    j += ",\"ageS\":"      + String(r.finished ? (now - r.finishedMs) / 1000 : 0);
+    j += "}";
+    j += ",\"settings\":" + buildSettingsListJson(shunt);
+    if (!shunt)
+    {
+        j += ",\"history\":" + buildHistoryJson();
+    }
+    j += "}";
+    return j;
+}
+
 void registerProjectApi()
 {
     g_webUi.setStatusExtension(buildStatusExtension);
@@ -1747,6 +2289,40 @@ void registerProjectApi()
                        bool ok = false;
                        const String result = sendWebCommand(command, ok);
                        out = commandResponse(ok, result);
+                       return 200;
+                   });
+
+    // ---- W4b Schritt 4: HEX-Daten (nur lesen) ----
+    g_webUi.addApi("/api/hex", WebUi::Method::Get,
+                   [](const ApiRequest& req, String& out) {
+                       const String role = req.arg("role");
+                       if (role != "shunt" && role != "mppt")
+                       {
+                           out = "{\"ok\":false,\"error\":\"role muss shunt oder mppt sein\"}";
+                           return 400;
+                       }
+                       out = buildHexJson(role == "shunt");
+                       return 200;
+                   });
+
+    // Neu einlesen (Reiter geöffnet oder Knopf). Startet, sobald das Gerät
+    // erkannt ist und keine Abfrage läuft. Kein automatisches Wiederholen.
+    g_webUi.addApi("/api/hex/refresh", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       const String role = req.arg("role");
+                       if (role != "shunt" && role != "mppt")
+                       {
+                           out = "{\"ok\":false,\"error\":\"role muss shunt oder mppt sein\"}";
+                           return 400;
+                       }
+                       const int index = roleChannel(role == "shunt");
+                       if (index < 0)
+                       {
+                           out = "{\"ok\":false,\"error\":\"Gerät nicht erkannt\"}";
+                           return 200;
+                       }
+                       requestHexRefresh(static_cast<size_t>(index));
+                       out = "{\"ok\":true}";
                        return 200;
                    });
 
@@ -2231,6 +2807,165 @@ void printDeviceEvent(const LogMessage& msg)
     }
 }
 
+/******************************************************************************
+ * W4b Schritt 2: HEX-Diagnose im seriellen Monitor
+ ******************************************************************************/
+/// Ungefragte HEX-Meldungen (":A…") anzeigen? Der MPPT sendet nach einer
+/// Anfrage ggf. 2 min lang viele davon ("hex async aus" zum Abschalten).
+bool g_showHexAsync = true;
+
+/// Abstand zum letzten gültigen Textblock (zeigt, ob Textblöcke pausieren).
+void printTextGap(const LogMessage& msg)
+{
+    if (msg.status.hasValidFrame)
+    {
+        Serial.printf("; letzter Textblock vor %lu ms",
+                      static_cast<unsigned long>(msg.timestampMs - msg.status.lastValidFrameMs));
+    }
+}
+
+void printHex(const LogMessage& msg)
+{
+    if (msg.kind == LogKind::HexMessage && msg.hex.response() == VeHex::Response::Async && !g_showHexAsync)
+    {
+        return;
+    }
+    printLinePrefix(msg);
+
+    if (msg.kind == LogKind::HexSent)
+    {
+        // Anfrage ohne das abschließende '\n' ausgeben
+        Serial.print("HEX -> ");
+        Serial.write(reinterpret_cast<const uint8_t*>(msg.hexRequest.text),
+                     msg.hexRequest.length > 0 ? msg.hexRequest.length - 1 : 0);
+        printTextGap(msg);
+        Serial.println();
+        return;
+    }
+
+    if (msg.kind == LogKind::HexError)
+    {
+        Serial.printf("!! HEX-Zeile fehlerhaft (gesamt: Prüfsumme %lu, Format %lu)",
+                      static_cast<unsigned long>(msg.status.hex.checksumErrors),
+                      static_cast<unsigned long>(msg.status.hex.malformed));
+        printTextGap(msg);
+        Serial.println();
+        return;
+    }
+
+    const VeHex::Message& m = msg.hex;
+    Serial.print("HEX <- ");
+    switch (m.response())
+    {
+        case VeHex::Response::Ping:
+        {
+            uint16_t version = 0;
+            uint8_t  type    = 0;
+            VeHex::decodePing(static_cast<uint16_t>(VeHex::readUnsigned(m.data, 2)), version, type);
+            static const char* const types[] = { "Bootloader", "Anwendung", "Tester", "Release Candidate" };
+            Serial.printf("Ping: Firmware %X.%02X (%s)", version >> 8, version & 0xFF, types[type & 3]);
+            break;
+        }
+        case VeHex::Response::Done:
+            Serial.printf("Antwort: 0x%04lX", static_cast<unsigned long>(VeHex::readUnsigned(m.data, m.length)));
+            break;
+        case VeHex::Response::Unknown:
+            Serial.print("Befehl unbekannt");
+            break;
+        case VeHex::Response::Error:
+            Serial.printf("Fehler 0x%04lX (0xAAAA = Rahmenfehler)",
+                          static_cast<unsigned long>(VeHex::readUnsigned(m.data, m.length)));
+            break;
+        case VeHex::Response::Get:
+        case VeHex::Response::Set:
+        case VeHex::Response::Async:
+        {
+            const char* name = m.response() == VeHex::Response::Get ? "Get"
+                             : m.response() == VeHex::Response::Set ? "Set" : "Async (ungefragt)";
+            if (!m.hasRegister())
+            {
+                Serial.printf("%s ohne Register (Länge %u)", name, static_cast<unsigned>(m.length));
+                break;
+            }
+            Serial.printf("%s 0x%04X Flags %02X Wert", name, m.registerId(), m.flags());
+            for (size_t i = 0; i < m.valueLength(); ++i)
+            {
+                Serial.printf(" %02X", m.value()[i]);
+            }
+            if (m.valueLength() >= 1 && m.valueLength() <= 4)
+            {
+                Serial.printf(" (= %lu)", static_cast<unsigned long>(VeHex::readUnsigned(m.value(), m.valueLength())));
+            }
+            if (m.flags() & VeHex::FlagUnknownId)      Serial.print(" [Register unbekannt]");
+            if (m.flags() & VeHex::FlagParameterError) Serial.print(" [Parameterfehler / keine Daten]");
+            break;
+        }
+        default:
+            Serial.printf("Code %X, %u Byte", m.code, static_cast<unsigned>(m.length));
+            break;
+    }
+    if (msg.hexAfterMs >= 0 && m.response() != VeHex::Response::Async)
+    {
+        Serial.printf("; %ld ms nach der Anfrage", static_cast<long>(msg.hexAfterMs));
+    }
+    printTextGap(msg);
+    Serial.println();
+}
+
+/// Ende einer automatischen Abfrage (W4b Schritt 3).
+void printHexJobDone(const LogMessage& msg)
+{
+    const HexJobRunner::Result& r = msg.status.hexJob;
+    printLinePrefix(msg);
+    if (r.aborted)
+    {
+        Serial.printf("!! HEX-Abfrage abgebrochen: Gerät antwortet nicht (%u von %u Registern versucht)\n",
+                      static_cast<unsigned>(r.answered + r.failed), static_cast<unsigned>(r.requested));
+        return;
+    }
+    Serial.printf("HEX-Abfrage fertig: %u von %u Registern beantwortet, %u ohne Antwort, Dauer %lu ms "
+                  "(Anzeige: hex cache)\n",
+                  static_cast<unsigned>(r.answered), static_cast<unsigned>(r.requested),
+                  static_cast<unsigned>(r.failed),
+                  static_cast<unsigned long>(r.finishedMs - r.startedMs));
+}
+
+/// Kopie des Zwischenspeichers für die Ausgabe (nicht auf den Stack, ~2 KB).
+HexRegisterCache g_printHexCache;
+
+/// Zwischenspeicher eines Kanals ausgeben ("hex cache").
+void printHexCache(size_t index)
+{
+    Channel& channel = g_channels[index];
+    {
+        StateLock lock(channel.stateMutex);
+        g_printHexCache = channel.hexCache;
+    }
+    const uint32_t now = millis();
+    Serial.printf("[%s] HEX-Zwischenspeicher: %u Register\n", channel.name,
+                  static_cast<unsigned>(g_printHexCache.size()));
+    static const char* const states[] = { "ok", "keine Daten", "unbekannt", "keine Antwort" };
+    for (size_t i = 0; i < g_printHexCache.size(); ++i)
+    {
+        const HexRegisterCache::Entry& e = g_printHexCache.at(i);
+        Serial.printf("  0x%04X %-13s vor %3lu s ", e.id, states[static_cast<uint8_t>(e.state) & 3],
+                      static_cast<unsigned long>((now - e.updatedMs) / 1000));
+        if (e.length >= 1 && e.length <= 4)
+        {
+            Serial.printf("= %lu (", static_cast<unsigned long>(VeHex::readUnsigned(e.value, e.length)));
+        }
+        else if (e.length > 0)
+        {
+            Serial.print("(");
+        }
+        for (size_t b = 0; b < e.length; ++b)
+        {
+            Serial.printf(b == 0 ? "%02X" : " %02X", e.value[b]);
+        }
+        Serial.println(e.length > 0 ? ")" : "");
+    }
+}
+
 /// Periodische Statuszeile je Kanal, auch wenn ein Kanal keine Daten liefert.
 void printStatusReport()
 {
@@ -2464,7 +3199,107 @@ bool g_showFrames = false;
 void printHelp()
 {
     Serial.println("[HILFE] Befehle: r1|r2|r3 ein|aus | override ein|aus | "
-                   "bloecke ein|aus | hilfe");
+                   "bloecke ein|aus | hex (Diagnose) | hilfe");
+}
+
+void printHexHelp()
+{
+    Serial.println("[HEX] Befehle (nur lesen): hex ping [1|2] | hex version [1|2] | "
+                   "hex pid [1|2] | hex get <Register> [1|2] | hex async ein|aus | "
+                   "hex lesen [1|2] | hex cache [1|2]");
+    Serial.println("[HEX] 1 = UART1, 2 = UART2, ohne Angabe beide. Register hex, z. B. "
+                   "hex get 1000 (Shunt: Kapazität), hex get edf0 (MPPT: max. Ladestrom), "
+                   "hex get 104f (MPPT: Historie gesamt)");
+}
+
+/// "hex …" auswerten. args = Rest der Zeile (Kleinbuchstaben, beginnt mit ' ' oder leer).
+void handleHexCommand(const char* args)
+{
+    char word[12]  = {};
+    char param[12] = {};
+    char target[4] = {};
+    const int n = std::sscanf(args, "%11s %11s %3s", word, param, target);
+    if (n < 1)
+    {
+        printHexHelp();
+        return;
+    }
+
+    // "hex lesen [1|2]" (automatische Abfrage neu starten), "hex cache [1|2]"
+    if (std::strcmp(word, "lesen") == 0 || std::strcmp(word, "cache") == 0)
+    {
+        const bool read = word[0] == 'l';
+        bool any = false;
+        for (size_t i = 0; i < ChannelCount; ++i)
+        {
+            if (param[0] == '\0' || (param[0] == static_cast<char>('1' + i) && param[1] == '\0'))
+            {
+                any = true;
+                if (read)
+                {
+                    requestHexRefresh(i);
+                    Serial.printf("[HEX] %s: Abfrage angefordert\n", g_channels[i].name);
+                }
+                else
+                {
+                    printHexCache(i);
+                }
+            }
+        }
+        if (!any)
+        {
+            Serial.println("[HEX] Kanal muss 1 oder 2 sein (oder weglassen = beide)");
+        }
+        return;
+    }
+
+    if (std::strcmp(word, "async") == 0)
+    {
+        g_showHexAsync = std::strcmp(param, "aus") != 0 && std::strcmp(param, "off") != 0;
+        Serial.printf("[HEX] Ungefragte Meldungen (:A) werden %s\n",
+                      g_showHexAsync ? "angezeigt" : "NICHT mehr angezeigt");
+        return;
+    }
+
+    VeHex::Request request;
+    const char* channelArg = param;   // bei ping/version/pid ist der 2. Parameter der Kanal
+    if (std::strcmp(word, "ping") == 0)         request = VeHex::ping();
+    else if (std::strcmp(word, "version") == 0) request = VeHex::appVersion();
+    else if (std::strcmp(word, "pid") == 0)     request = VeHex::productId();
+    else if (std::strcmp(word, "get") == 0)
+    {
+        const char* hex = (param[0] == '0' && param[1] == 'x') ? param + 2 : param;
+        char* end = nullptr;
+        const unsigned long reg = std::strtoul(hex, &end, 16);
+        if (hex[0] == '\0' || end == nullptr || *end != '\0' || reg > 0xFFFF)
+        {
+            Serial.println("[HEX] Register fehlt oder ungültig (Hex-Zahl 0..FFFF)");
+            return;
+        }
+        request    = VeHex::get(static_cast<uint16_t>(reg));
+        channelArg = target;
+    }
+    else
+    {
+        printHexHelp();
+        return;
+    }
+
+    bool sent = false;
+    for (size_t i = 0; i < ChannelCount; ++i)
+    {
+        const bool wanted = channelArg[0] == '\0' ||
+                            (channelArg[0] == static_cast<char>('1' + i) && channelArg[1] == '\0');
+        if (wanted)
+        {
+            requestHex(i, request);
+            sent = true;
+        }
+    }
+    if (!sent)
+    {
+        Serial.println("[HEX] Kanal muss 1 oder 2 sein (oder weglassen = beide)");
+    }
 }
 
 /// Eine vollständige Eingabezeile auswerten.
@@ -2507,6 +3342,13 @@ void handleCommandLine(char* line)
     {
         g_showFrames = false;
         Serial.println("[AUSGABE] Blockausgabe AUS (nur Status, Ereignisse, Befehle)");
+        return;
+    }
+
+    // ---- W4b Schritt 2: HEX-Diagnose (nur lesende Anfragen) ----
+    if (std::strncmp(line, "hex", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
+    {
+        handleHexCommand(line + 3);
         return;
     }
 
@@ -2711,6 +3553,16 @@ void loggerTask(void*)
                 case LogKind::DeviceChanged:
                 case LogKind::DeviceLost:
                     printDeviceEvent(g_incoming);
+                    break;
+
+                case LogKind::HexSent:
+                case LogKind::HexMessage:
+                case LogKind::HexError:
+                    printHex(g_incoming);
+                    break;
+
+                case LogKind::HexJobDone:
+                    printHexJobDone(g_incoming);
                     break;
             }
         }

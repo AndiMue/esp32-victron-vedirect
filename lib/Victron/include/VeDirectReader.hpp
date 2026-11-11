@@ -16,6 +16,7 @@
 
 #include <Arduino.h>
 
+#include <cstddef>
 class VeDirectReader
 {
 public:
@@ -30,6 +31,9 @@ public:
     bool available() const;
     char read();
     void flush();
+
+    /// W4b: Text an das Gerät senden (HEX-Anfragen, nur lesend, siehe VeDirectHex).
+    void write(const char* text, std::size_t length);
 
 private:
 

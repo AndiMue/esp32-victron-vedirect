@@ -54,20 +54,31 @@ function savePref(key, value) {
 }
 
 // ---------------------------------------------------------------------------
-// Reiter (W4a): Hauptreiter + Unterreiter im Sammelreiter "System"
+// Reiter (W4a): Hauptreiter + Unterreiter in "System" und (W4b) "Einstellungen".
+// Jeder Hauptreiter mit Unterreitern merkt sich seinen eigenen Unterreiter.
 // ---------------------------------------------------------------------------
 let currentTab = "";
-let currentSub = "";
+let currentSub = "";   // Unterreiter in "System" (für den Neustart nach Updates usw.)
 
-function showSub(name) {
-  if (!$("sub-" + name)) name = "info";
-  currentSub = name;
-  savePref("sub", name);
-  document.querySelectorAll(".subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === name));
-  document.querySelectorAll(".subpanel").forEach((p) => p.classList.toggle("hidden", p.id !== "sub-" + name));
+const subDefaults = { system: "info", settings: "control" };
+
+/// Unterreiter "name" im Hauptreiter "tab" anzeigen.
+function showSubIn(tab, name) {
+  const section = $("tab-" + tab);
+  if (!section.querySelector("#sub-" + name)) name = subDefaults[tab];
+  if (tab === "system") currentSub = name;
+  savePref("sub." + tab, name);
+  section.querySelectorAll(".subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === name));
+  section.querySelectorAll(".subpanel").forEach((p) => p.classList.toggle("hidden", p.id !== "sub-" + name));
   if (name === "wifi") loadWifi();
   if (name === "mqtt") loadMqtt();
+  if (name === "control") loadSettings();
+  if (name === "shuntset") readHex("shunt");
+  if (name === "mpptset") readHex("mppt");
 }
+
+/// Unterreiter im Sammelreiter "System" (wird auch von anderer Stelle genutzt).
+function showSub(name) { showSubIn("system", name); }
 
 function showTab(name) {
   if (!$("tab-" + name)) name = "overview";
@@ -75,18 +86,19 @@ function showTab(name) {
   savePref("tab", name);
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("hidden", p.id !== "tab-" + name));
-  if (name === "system") showSub(currentSub || loadPref("sub", "info"));
+  if (subDefaults[name]) showSubIn(name, loadPref("sub." + name, loadPref(name === "system" ? "sub" : "-", subDefaults[name])));
   if (name === "overview") refreshLive();
   if (name === "shunt" || name === "mppt" || name === "history") refreshDevices();
+  if (name === "history") readHex("mppt");
   if (name === "faults") refreshFaults();
-  if (name === "settings") loadSettings();
 }
 
 document.querySelectorAll(".tab").forEach((btn) => {
   btn.addEventListener("click", () => showTab(btn.dataset.tab));
 });
 document.querySelectorAll(".subtab").forEach((btn) => {
-  btn.addEventListener("click", () => showSub(btn.dataset.sub));
+  const tab = btn.closest(".panel").id.replace("tab-", "");
+  btn.addEventListener("click", () => showSubIn(tab, btn.dataset.sub));
 });
 showTab(loadPref("tab", "overview"));
 
@@ -557,6 +569,175 @@ $("setInstallBtn").addEventListener("click", async () => {
   } catch (e) {
     toast(e.message, true);
   }
+});
+
+// ---------------------------------------------------------------------------
+// W4b: Daten per HEX-Protokoll (nur lesen). Gelesen wird beim Öffnen des
+// Reiters und per Knopf, NICHT im Aktualisierungstakt (Projektinhaber).
+// showTab() läuft schon oben beim Laden der Datei, also bevor Variablen
+// hier unten belegt sind. Deshalb steht der Zustand als Eigenschaft an der
+// (vorab bekannten) Funktion readHex selbst.
+// ---------------------------------------------------------------------------
+function wait(ms) { return new Promise((res) => setTimeout(res, ms)); }
+
+/// Neu einlesen anfordern und warten, bis das Gerät fertig ist (max. 20 s).
+async function readHex(role) {
+  const hexReading = readHex.running || (readHex.running = {});   // je Rolle: läuft gerade
+  if (hexReading[role]) return;
+  hexReading[role] = true;
+  // Ein Lesen füllt alle Anzeigen dieser Rolle (MPPT: Historie + Einstellungen)
+  const render = (h) => {
+    if (role === "mppt") renderMpptHistory(h);
+    renderHexSettings(role, h);
+  };
+  try {
+    const r = await api("/api/hex/refresh", { role: role });
+    if (!r.ok) {
+      render({ present: false });
+      return;
+    }
+    render(null);   // "wird gelesen …"
+    for (let i = 0; i < 40; i++) {
+      await wait(500);
+      const h = await api("/api/hex?role=" + role);
+      if (!h.present || (!h.pending && !h.busy)) {
+        render(h);
+        return;
+      }
+    }
+    render(await api("/api/hex?role=" + role));
+  } catch (e) {
+    toast("Keine Verbindung zum Gerät", true);
+  } finally {
+    hexReading[role] = false;
+  }
+}
+
+function fmtKWh(v) { return v === null || v === undefined ? "–" : num(v, 2) + " kWh"; }
+function fmtV(v)   { return v === null || v === undefined ? "–" : num(v, 2) + " V"; }
+function fmtMin(m) { return m >= 60 ? Math.floor(m / 60) + " h " + (m % 60) + " min" : m + " min"; }
+
+function dayLabel(ago) {
+  if (ago === 0) return "heute";
+  if (ago === 1) return "gestern";
+  return "vor " + ago + " Tagen";
+}
+
+const hexStateText = {
+  nodata: "keine Daten",
+  unknown: "nicht verfügbar",
+  noanswer: "keine Antwort",
+  missing: "nicht gelesen",
+};
+
+/// Anzeige der MPPT-Historie. h = null: wird gerade gelesen.
+function renderMpptHistory(h) {
+  const status = $("hxStatus");
+  if (h === null) {
+    status.textContent = "Wird aus dem MPPT gelesen …";
+    $("hxRefresh").disabled = true;
+    return;
+  }
+  $("hxRefresh").disabled = false;
+  const clear = () => { $("hxTotal").innerHTML = ""; $("hxChart").innerHTML = ""; $("hxDays").innerHTML = ""; };
+
+  if (!h.present) {
+    status.textContent = "MPPT nicht erkannt.";
+    clear();
+    return;
+  }
+  if (h.pending || h.busy) {
+    status.textContent = "Lesen dauert länger als erwartet – bitte später erneut versuchen.";
+    return;
+  }
+  if (h.job.aborted) {
+    status.textContent = "Der MPPT (" + h.uart + ") antwortet nicht auf HEX-Anfragen – Historie nicht verfügbar. " +
+      "(Bei einem Simulator, der nur Text sendet, ist das normal.)";
+    clear();
+    return;
+  }
+  status.textContent = h.device + " (" + h.uart + "), gelesen " + formatAgo(h.job.ageS) +
+    (h.job.failed ? ", " + h.job.failed + " Werte ohne Antwort" : "");
+
+  // Gesamtwerte
+  const t = h.history.total;
+  if (t.state === "ok") {
+    const rows = [
+      ["Gesamtertrag", fmtKWh(t.userYieldKWh) + " (System: " + fmtKWh(t.systemYieldKWh) + ")"],
+      ["Panelspannung max.", fmtV(t.panelMaxV)],
+      ["Batteriespannung max./min.", fmtV(t.batteryMaxV) + " / " + fmtV(t.batteryMinV)],
+      ["Tage mit Daten", String(t.daysAvailable)],
+    ];
+    if (t.errors.length) rows.push(["Letzte Fehler", t.errors.join(", ")]);
+    $("hxTotal").innerHTML = grid(rows);
+  } else {
+    $("hxTotal").innerHTML = grid([["Gesamtwerte", hexStateText[t.state] || t.state]]);
+  }
+
+  // Balkendiagramm Tagesertrag (ältester links, heute rechts)
+  const days = h.history.days.slice().reverse();
+  const max = Math.max(0.01, ...days.map((d) => (d.state === "ok" ? d.yieldKWh : 0)));
+  $("hxChart").innerHTML = days.map((d) => {
+    const v = d.state === "ok" ? d.yieldKWh : 0;
+    const pct = Math.round((v / max) * 100);
+    const tip = dayLabel(d.ago) + ": " + (d.state === "ok" ? fmtKWh(v) : (hexStateText[d.state] || d.state));
+    return '<div class="bar' + (d.state === "ok" ? "" : " empty") + '" title="' + escapeHtml(tip) +
+      '"><span style="height:' + pct + '%"></span></div>';
+  }).join("") + '<div class="barlabels"><span>vor 30 Tagen</span><span>max. ' + fmtKWh(max) + "</span><span>heute</span></div>";
+
+  // Tabelle (heute oben)
+  const head = "<tr><th>Tag</th><th>Ertrag</th><th>P max</th><th>Batterie min–max</th>" +
+    "<th>Bulk / Abs. / Erh.</th><th>Fehler</th></tr>";
+  $("hxDays").innerHTML = head + h.history.days.map((d) => {
+    if (d.state !== "ok") {
+      return '<tr class="stale"><td>' + dayLabel(d.ago) + '</td><td colspan="5">' +
+        escapeHtml(hexStateText[d.state] || d.state) + "</td></tr>";
+    }
+    return "<tr><td>" + dayLabel(d.ago) + "</td><td>" + fmtKWh(d.yieldKWh) + "</td><td>" + d.powerMaxW + " W</td>" +
+      "<td>" + num(d.batteryMinV, 2) + "–" + num(d.batteryMaxV, 2) + " V</td>" +
+      "<td>" + fmtMin(d.bulkMin) + " / " + fmtMin(d.absorptionMin) + " / " + fmtMin(d.floatMin) + "</td>" +
+      '<td class="' + (d.errors.length ? "err" : "") + '">' + (d.errors.length ? escapeHtml(d.errors.join(", ")) : "–") + "</td></tr>";
+  }).join("");
+}
+
+$("hxRefresh").addEventListener("click", () => readHex("mppt"));
+
+/// Geräteeinstellungen (nur lesen) im Reiter Einstellungen → Shunt / MPPT.
+/// h = null: wird gerade gelesen.
+function renderHexSettings(role, h) {
+  const prefix = role === "shunt" ? "hsShunt" : "hsMppt";
+  const status = $(prefix + "Status");
+  const table = $(prefix);
+  const name = role === "shunt" ? "SmartShunt" : "MPPT";
+  document.querySelectorAll('button.hexreload[data-role="' + role + '"]').forEach((b) => (b.disabled = h === null));
+  if (h === null) {
+    status.textContent = "Wird aus dem " + name + " gelesen …";
+    return;
+  }
+  if (!h.present) {
+    status.textContent = name + " nicht erkannt.";
+    table.innerHTML = "";
+    return;
+  }
+  if (h.pending || h.busy) {
+    status.textContent = "Lesen dauert länger als erwartet – bitte später erneut versuchen.";
+    return;
+  }
+  if (h.job.aborted) {
+    status.textContent = "Der " + name + " (" + h.uart + ") antwortet nicht auf HEX-Anfragen – Einstellungen nicht verfügbar. " +
+      "(Bei einem Simulator, der nur Text sendet, ist das normal.)";
+    table.innerHTML = "";
+    return;
+  }
+  status.textContent = h.device + " (" + h.uart + "), gelesen " + formatAgo(h.job.ageS);
+  table.innerHTML = h.settings.length
+    ? h.settings.map((s) => "<tr" + (s.state === "ok" ? "" : ' class="stale"') + "><td>" + escapeHtml(s.name) +
+        "</td><td>" + escapeHtml(s.state === "ok" ? s.value : (hexStateText[s.state] || s.state)) + "</td></tr>").join("")
+    : '<tr><td class="muted">Keine Einstellungen gelesen.</td></tr>';
+}
+
+document.querySelectorAll("button.hexreload").forEach((b) => {
+  b.addEventListener("click", () => readHex(b.dataset.role));
 });
 
 // Start: sofort einmal alles holen, dann im gewählten Takt

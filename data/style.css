@@ -231,6 +231,22 @@ table.events td.when { color: var(--muted); white-space: nowrap; }
 .pill.warn     { background: var(--danger); color: #fff; }
 .pill.disabled { background: transparent; color: var(--muted); text-decoration: line-through; }
 
+/* ---- W4b Schritt 4: MPPT-Historie (30 Tage) ---- */
+.hexhead { display: flex; align-items: center; gap: 10px; justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px; }
+.barchart { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 2px; height: 110px; margin: 12px 0 26px;
+            border-bottom: 1px solid var(--border); position: relative; }
+.barchart .bar { flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; min-width: 3px; }
+.barchart .bar span { display: block; width: 100%; background: #f0a020; border-radius: 2px 2px 0 0; min-height: 1px; }
+.barchart .bar.empty span { background: transparent; }
+.barchart .barlabels { position: absolute; left: 0; right: 0; bottom: -20px; display: flex; justify-content: space-between;
+                       font-size: 0.75rem; color: var(--muted); }
+.tablewrap { overflow-x: auto; }
+table.days { width: 100%; border-collapse: collapse; font-size: 0.85rem; white-space: nowrap; }
+table.days th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px; border-bottom: 2px solid var(--border); }
+table.days td { padding: 4px; border-bottom: 1px solid var(--border); }
+table.days tr.stale td { color: #9aa5b1; }
+table.days td.err { color: var(--danger); white-space: normal; }
+
 /* ---- W4a Schritt 5: Einstellungen ---- */
 .setgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
 .setgrid label { margin: 8px 0; }

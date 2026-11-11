@@ -126,8 +126,21 @@
       <hr>
       <h2>Solar (MPPT)</h2>
       <table class="fields" id="histMppt"></table>
+
+      <hr>
+      <h2>Solar (MPPT) – letzte 30 Tage</h2>
+      <div class="hexhead">
+        <span id="hxStatus" class="muted">–</span>
+        <button id="hxRefresh" class="small secondary">Neu einlesen</button>
+      </div>
+      <dl class="grid" id="hxTotal"></dl>
+      <div id="hxChart" class="barchart" aria-label="Tagesertrag der letzten 30 Tage"></div>
+      <div class="tablewrap">
+        <table class="days" id="hxDays"></table>
+      </div>
       <p class="hint">Die Historie stammt aus den Geräten selbst (Victron zählt seit Inbetriebnahme bzw. letztem Löschen).
-        Die 30-Tage-Historie des MPPT folgt in W4b.</p>
+        Die 30-Tage-Historie wird beim Öffnen dieses Reiters und mit „Neu einlesen“ aus dem MPPT gelesen
+        (dauert ca. 1 s). Sie wird nicht laufend aktualisiert.</p>
     </section>
 
     <!-- ===================== Fehler ===================== -->
@@ -152,6 +165,14 @@
 
     <!-- ===================== Einstellungen ===================== -->
     <section id="tab-settings" class="panel hidden">
+      <nav class="subtabs">
+        <button class="subtab" data-sub="control">Steuerung</button>
+        <button class="subtab" data-sub="shuntset">Shunt</button>
+        <button class="subtab" data-sub="mpptset">MPPT</button>
+      </nav>
+
+      <!-- ---------- Einstellungen → Steuerung (Relais, Anlage) ---------- -->
+      <div id="sub-control" class="subpanel hidden">
       <h2>Relais</h2>
       <p class="hint" style="margin-top:0">
         SOC-Schwellen in %. Regel: <b>Aus unter ≤ Sperre unter ≤ Frei ab</b>.
@@ -173,6 +194,28 @@
       <button id="setInstallBtn" class="danger">Übernehmen und neu starten</button>
       <p class="hint">Beim Wechsel werden alle geänderten Relais-Einstellungen auf die Voreinstellung
         der neuen Anlage zurückgesetzt. Das Gerät startet neu, die Relais fallen dabei kurz ab.</p>
+      </div>
+
+      <!-- ---------- Einstellungen → Shunt / MPPT (W4b, nur lesen) ---------- -->
+      <div id="sub-shuntset" class="subpanel hidden">
+        <h2>SmartShunt – Einstellungen</h2>
+        <div class="hexhead">
+          <span id="hsShuntStatus" class="muted">–</span>
+          <button class="small secondary hexreload" data-role="shunt">Neu einlesen</button>
+        </div>
+        <table class="fields" id="hsShunt"></table>
+        <p class="hint">Nur Anzeige. Ändern nur über die App VictronConnect.</p>
+      </div>
+
+      <div id="sub-mpptset" class="subpanel hidden">
+        <h2>MPPT – Einstellungen</h2>
+        <div class="hexhead">
+          <span id="hsMpptStatus" class="muted">–</span>
+          <button class="small secondary hexreload" data-role="mppt">Neu einlesen</button>
+        </div>
+        <table class="fields" id="hsMppt"></table>
+        <p class="hint">Nur Anzeige. Ändern nur über die App VictronConnect.</p>
+      </div>
     </section>
 
     <!-- ===================== System (Sammelreiter) ===================== -->

@@ -1,6 +1,6 @@
 # Bedienungsanleitung – VE.Direct Steuergerät
 
-> **Stand:** 10.11.2026, Firmware ab `26.11.10-1804`, WebUI ab `26.11.10-1819`
+> **Stand:** 11.11.2026, Firmware und WebUI ab `26.11.11-1705`
 > **Status:** Entwurf, wächst mit jeder Entwicklungsstufe mit.
 > Abschnitte mit *„folgt“* sind noch nicht umgesetzt.
 
@@ -47,7 +47,7 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
 5. Anmelden mit Benutzer **`admin`** und dem **Startpasswort**.
 6. Unter **System → WLAN** das Heimnetz einrichten (siehe Kapitel 4).
 7. Unter **System → Gerät** das Passwort ändern (siehe Kapitel 5). Danach verschwindet das Passwort vom Display. Solange das Startpasswort gilt, zeigt die WebUI oben einen gelben Hinweis.
-8. Unter **Einstellungen** die **Anlage** prüfen (Camper oder Balkonkraftwerk, siehe Kapitel 7.5).
+8. Unter **Einstellungen → Steuerung** die **Anlage** prüfen (Camper oder Balkonkraftwerk, siehe Kapitel 7.5).
 
 ---
 
@@ -65,15 +65,17 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
 | **Übersicht** | SOC, Spannung, Strom, Leistung, Restlaufzeit, PV-Werte, Verbindungen; Relais schalten; Override (Kapitel 7) |
 | **Shunt** | alle Werte des SmartShunt im Klartext, Verbindungsstatistik |
 | **MPPT** | alle Werte des Solarladereglers im Klartext, Verbindungsstatistik |
-| **Historie** | Historienwerte von Shunt und MPPT (z. B. tiefste Entladung, Ertrag gesamt) |
+| **Historie** | Historienwerte von Shunt und MPPT (z. B. tiefste Entladung, Ertrag gesamt) und die **MPPT-Historie der letzten 30 Tage** (Kapitel 3.4) |
 | **Fehler** | aktive Fehler, Gerätemeldungen, letzter Neustart, Ereignisliste (Kapitel 3.3) |
-| **Einstellungen** | Relais-Schwellen und Anlage (Kapitel 7.4 und 7.5) |
+| **Einstellungen** | Unterreiter **Steuerung** (Relais-Schwellen und Anlage, Kapitel 7.4 und 7.5), **Shunt** und **MPPT** (Geräteeinstellungen, nur Anzeige, Kapitel 3.5) |
 | **System** | Unterreiter **Info** (Netzwerk, MQTT, Versionen, Laufzeit, freier Speicher), **WLAN** (Kapitel 4), **MQTT** (Kapitel 9), **Gerät** (Passwort, Neustart, Kapitel 5), **Update** (Kapitel 8) |
 
 ### 3.2 Anzeigen und Aktualisierung
 
 - **Aktualisierung:** Unten auf der Seite wählbar (2, 5, 10 oder 30 s, Standard 5 s). Die Einstellung gilt nur für diesen Browser. Ist die Seite im Hintergrund, wird nicht abgefragt.
 - Der Reiter *Einstellungen* wird **nicht** automatisch aktualisiert, damit Eingaben nicht überschrieben werden.
+- Die MPPT-Historie (30 Tage) und die Geräteeinstellungen werden ebenfalls **nicht** im Takt aktualisiert, sondern nur beim Öffnen des (Unter-)Reiters und mit **„Neu einlesen“** aus dem Gerät gelesen (Kapitel 3.4, 3.5).
+- Der zuletzt gewählte Reiter und Unterreiter werden im Browser gemerkt.
 - **Zahl am Reiter „Fehler“** (rot): Anzahl der aktiven Fehler, unabhängig von der Schwere.
 - **Roter Balken oben** (auf allen Reitern): Es liegt ein kritischer Fehler vor. Ein Klick darauf öffnet den Reiter *Fehler*.
 - In den Reitern *Shunt* und *MPPT* werden Werte, die älter als 10 s sind, grau mit „vor x s“ angezeigt.
@@ -92,6 +94,40 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
   - Fehler aufgetreten / behoben (erst ab 10 s nach dem Start, vorher werden die Geräte noch erkannt)
   - geänderte Relais-Einstellungen, Zurücksetzen auf Voreinstellung, Anlagenwechsel
 - Die Ereignisliste liegt im Arbeitsspeicher und ist nach einem Neustart leer (bis auf den Start selbst).
+- Antwortet ein Victron-Gerät nicht auf Leseanfragen (Kapitel 3.4), steht dort die Info „Gerät antwortet nicht auf HEX-Anfragen“.
+
+### 3.4 MPPT-Historie (Reiter „Historie“, letzte 30 Tage)
+
+Der MPPT speichert für jeden der letzten 30 Tage eine Tageszusammenfassung. Das Steuergerät liest sie aus dem MPPT:
+- einmal kurz nach dem Erkennen des MPPT,
+- beim Öffnen des Reiters *Historie*,
+- mit dem Knopf **„Neu einlesen“**.
+
+Das Lesen dauert etwa 1 s. Danach zeigt der Reiter:
+- **Statuszeile:** Gerät, Anschluss und wann gelesen wurde.
+- **Gesamtwerte:** Gesamtertrag, höchste Panelspannung, höchste und niedrigste Batteriespannung, Anzahl Tage mit Daten, letzte Fehler.
+- **Balkendiagramm** des Tagesertrags (links vor 30 Tagen, rechts heute; Wert beim Darüberfahren bzw. Antippen).
+- **Tabelle je Tag:** Ertrag, Maximalleistung, Batteriespannung min–max, Zeit in Bulk / Absorption / Erhaltung, Fehler (rot). Auf dem Handy waagerecht wischbar.
+
+Tage ohne Daten (z. B. nach dem Löschen der Historie) erscheinen grau mit „keine Daten“. Antwortet der MPPT nicht, steht dort „antwortet nicht auf HEX-Anfragen“.
+
+### 3.5 Geräteeinstellungen (Einstellungen → Shunt / MPPT)
+
+Zeigt die aktuellen Einstellungen der Victron-Geräte an – **nur zur Ansicht**. Ändern ist nur mit der App **VictronConnect** möglich (Schutz vor versehentlichem Verstellen; falsche Ladespannungen können den Akku schädigen).
+
+Gelesen wird beim Öffnen des Unterreiters und mit **„Neu einlesen“**.
+
+| SmartShunt (Namen wie in VictronConnect) | MPPT |
+|---|---|
+| Batteriekapazität | Batteriespannung (12/24 V oder automatisch) |
+| Spannung wenn aufgeladen | Absorptionsspannung |
+| Schweifstrom | Erhaltungsspannung |
+| Zeit für Ladezustandserkennung | Max. Ladestrom |
+| Ladewirkungsgrad | Batterietyp (mit Typnummer des Drehschalters) |
+| Peukert-Exponent | Temperaturkompensation |
+| Strom-Schwellwert | Lastausgang (nur bei Modellen mit Lastausgang) |
+| Durchschnittliche Restlaufzeit | |
+| Entladungsboden | |
 - **Reaktionszeit:** Wird ein Gerät abgezogen, erscheint der Fehler nach ca. 5–7 s auf dem Display und nach ca. 5–8 s in der WebUI (je nach Aktualisierungstakt). Die Wartezeit von 5 s verhindert Fehlalarme bei einzelnen verlorenen Datenblöcken.
 
 ---
@@ -172,7 +208,7 @@ Wird die Taste zu früh oder gar nicht losgelassen, passiert nichts. Relais-Eins
 - Nach jedem Schaltbefehl in der WebUI erscheint unten eine Rückmeldung, z. B. „ausgeführt“ oder „abgelehnt: SOC zu niedrig oder kein gültiger SOC“ (rot).
 - Unter jedem Relais stehen Zustand (**EIN**/**AUS**/deaktiviert), Sperre, ein wartender Schaltwunsch, die Schwellen und der Grund der letzten Änderung.
 
-**Nach dem Einschalten des Geräts (Voreinstellung Camper):** Wechselrichter **aus**, Licht und Kühlschrank **ein**. Änderbar unter *Einstellungen* („Zustand nach Neustart“).
+**Nach dem Einschalten des Geräts (Voreinstellung Camper):** Wechselrichter **aus**, Licht und Kühlschrank **ein**. Änderbar unter *Einstellungen → Steuerung* („Zustand nach Neustart“).
 
 ### 7.2 Schwellen und Schutzabschaltung
 
@@ -188,7 +224,7 @@ Wird die Taste zu früh oder gar nicht losgelassen, passiert nichts. Relais-Eins
 - Nach einer Schutzabschaltung schalten **Licht und Kühlschrank automatisch wieder ein**, sobald der SOC die Freigabeschwelle erreicht (frühestens nach 60 s). Der **Wechselrichter** muss neu eingeschaltet werden. Im Balkonkraftwerk schaltet der **DC-DC-Wandler** automatisch wieder ein.
 - **Ohne SmartShunt** (kein gültiger SOC) wird der Wechselrichter ausgeschaltet und gesperrt. Licht und Kühlschrank laufen weiter.
 - Wird ein Relais unterhalb der Sperrschwelle eingeschaltet, wird der Wunsch gespeichert und bei ausreichendem SOC ausgeführt (Licht, Kühlschrank, DC-DC) bzw. abgelehnt (Wechselrichter).
-- Schwellen einstellen: Reiter *Einstellungen* (Kapitel 7.4).
+- Schwellen einstellen: *Einstellungen → Steuerung* (Kapitel 7.4).
 
 ### 7.3 Override
 
@@ -199,7 +235,7 @@ Wird die Taste zu früh oder gar nicht losgelassen, passiert nichts. Relais-Eins
 
 > ⚠ **Verantwortung beim Benutzer:** Im Override schützt nur noch das BMS des Akkus vor Tiefentladung. Wer den Override einschaltet, übernimmt die Verantwortung für Akku und Verbraucher. Override nur kurzzeitig und bewusst verwenden, z. B. in einer Notsituation, und danach wieder ausschalten.
 
-### 7.4 Relais-Einstellungen (Reiter „Einstellungen“)
+### 7.4 Relais-Einstellungen (Einstellungen → Steuerung)
 
 Je Relais lassen sich ändern:
 
@@ -221,7 +257,7 @@ Je Relais lassen sich ändern:
 
 ### 7.5 Anlage (Camper / Balkonkraftwerk)
 
-- Auswahl im Reiter *Einstellungen* unter **Anlage**, dann **Übernehmen und neu starten**.
+- Auswahl unter *Einstellungen → Steuerung* bei **Anlage**, dann **Übernehmen und neu starten**.
 - Die Anlage bestimmt Namen, aktive Relais und die Voreinstellung (Tabelle in Kapitel 1 und 7.2).
 - Beim Wechsel werden **alle geänderten Relais-Einstellungen gelöscht**, es gilt die Voreinstellung der neuen Anlage. Das Gerät startet neu, **alle Relais fallen dabei kurz ab**.
 
@@ -364,6 +400,7 @@ Mögliche Ergebnisse: „ausgeführt“, „gespeichert, wird bei ausreichendem 
 | Hinweis „vorherige Firmware“ unter *System → Update* | Die neue Firmware lief nicht stabil, das Gerät hat automatisch zurückgeschaltet |
 | Relais lässt sich nicht einschalten | Rückmeldung bzw. Hinweis unter dem Relais beachten: SOC unter „Sperre unter“/„Frei ab“ noch nicht erreicht, oder kein gültiger SOC (Shunt fehlt) |
 | Relais schaltet unerwartet ab | Reiter *Fehler* → Ereignisliste zeigt den Grund (z. B. „SOC unter Abschaltschwelle“) |
+| Historie/Geräteeinstellungen: „antwortet nicht auf HEX-Anfragen“ | Die Leitung vom Steuergerät **zum** Victron-Gerät (TX) fehlt oder ist vertauscht; Live-Werte kommen trotzdem, weil sie nur in die andere Richtung laufen. Kabel prüfen. Simulatoren, die nur Text senden, antworten nie. |
 | Passwort vergessen | Reset-Taste (Kapitel 5) |
 
 ### 10.1 Notweg: WebUI per USB neu aufspielen
@@ -398,5 +435,74 @@ Einstellungen (WLAN, Passwort, MQTT, Relais, Anlage) bleiben dabei erhalten; sie
 | 8 | `0x100` | Verbindung MPPT instabil | Warnung |
 | 9 | `0x200` | Unbekanntes Gerät | Info |
 
-### 11.3 Serieller Monitor (nur Entwicklung, USB)
-`r1|r2|r3 ein|aus`, `override ein|aus`, `bloecke ein|aus` (vollständige Rohdaten), `hilfe`.
+### 11.3 Serieller Monitor – nur für Entwickler
+
+> ⚠ **Nur für Entwicklung und Fehlersuche.** Diese Befehle sind nicht Teil der normalen Bedienung. Sie wirken direkt auf das Gerät, auch auf die Relais. Für den Betrieb die Weboberfläche oder MQTT verwenden.
+
+**Verbindung:** ESP32 per USB an den PC, serieller Monitor mit **115200 Baud** (VS Code: PlatformIO → *Monitor*). Befehl eintippen und mit Enter abschicken. Groß-/Kleinschreibung ist egal. Unbekannte Eingaben zeigen die Hilfe.
+
+Alle 5 s erscheinen Statuszeilen: `[STATUS]` je Anschluss (Gerät, Zähler, Verbindung), `[SYSTEM]` (Batterie, PV, Fehlerwort), `[RELAIS]`, `[WLAN]`. Ereignisse (Gerät erkannt/verloren, Befehle, Fehler) erscheinen sofort.
+
+#### Relais und Override
+
+| Befehl | Wirkung |
+|---|---|
+| `r1 ein` / `r1 aus` | Relais R1 ein/aus (ebenso `r2`, `r3`; statt `ein` auch `an`/`on`, statt `aus` auch `off`) |
+| `override ein` / `override aus` | Override ein/aus (hebt alle Schutzsperren auf, siehe Kapitel 7.3) |
+
+Befehle aus dem Monitor zählen als Quelle **„lokal“** (wie später Taster/Touch). Es gelten dieselben Regeln wie bei WebUI und MQTT (SOC-Schutz, Rückmeldung `[BEFEHL] …`).
+
+#### Anzeige
+
+| Befehl | Wirkung |
+|---|---|
+| `bloecke ein` / `bloecke aus` | jeden empfangenen VE.Direct-Textblock vollständig ausgeben (Klarname + Rohwert). Standard: aus |
+| `hilfe` | Befehlsübersicht |
+
+#### HEX-Protokoll (W4b, nur lesend)
+
+Das Gerät kann damit **nur lesen**. Befehle zum Verstellen der Victron-Geräte gibt es nicht. `1` = UART1, `2` = UART2, ohne Angabe = beide Anschlüsse.
+
+| Befehl | Wirkung |
+|---|---|
+| `hex` | Übersicht der HEX-Befehle |
+| `hex ping [1\|2]` | Lebenszeichen; Antwort mit Firmware-Version des Geräts. Prüft auch, ob die TX-Leitung funktioniert |
+| `hex version [1\|2]` | Firmware-Version |
+| `hex pid [1\|2]` | Produkt-ID (z. B. `0xC035` = SmartShunt 500A/50mV) |
+| `hex get <Register> [1\|2]` | ein Register lesen, Register als Hex-Zahl, z. B. `hex get 1000 1` |
+| `hex lesen [1\|2]` | automatische Abfrage neu starten (Shunt: Einstellungen; MPPT: Einstellungen + Historie) |
+| `hex cache [1\|2]` | zuletzt gelesene Werte anzeigen (Register, Zustand, Alter, Rohwert) |
+| `hex async ein` / `hex async aus` | ungefragte Meldungen des MPPT (`:A…`) anzeigen bzw. ausblenden |
+
+Ausgabe einer Anfrage, z. B.:
+```
+[UART1] HEX -> :154; letzter Textblock vor 201 ms
+[UART1] HEX <- Ping: Firmware 4.20 (Anwendung); 8 ms nach der Anfrage; letzter Textblock vor 209 ms
+```
+„letzter Textblock vor … ms“ zeigt, ob die Textblöcke während HEX-Verkehr weiterlaufen (unter ca. 1,5 s = normal).
+
+Nützliche Register (Werte als Rohzahl, Umrechnung in Klammern):
+
+| Gerät | Register | Bedeutung |
+|---|---|---|
+| SmartShunt | `1000` | Batteriekapazität (Ah) |
+| SmartShunt | `1001` | Ladespannung (0,1 V, z. B. 140 = 14,0 V) |
+| SmartShunt | `1002` | Schweifstrom (0,1 %) |
+| SmartShunt | `1003` | Ladeerkennungszeit (min) |
+| SmartShunt | `1004` | Ladewirkungsgrad (%) |
+| SmartShunt | `1005` | Peukert-Exponent (0,01, z. B. 125 = 1,25) |
+| SmartShunt | `1006` | Strom-Schwellwert (0,01 A) |
+| SmartShunt | `1007` | Durchschnittliche Restlaufzeit (min) |
+| SmartShunt | `1008` | Entladeboden (0,1 %) |
+| MPPT | `edf0` | max. Ladestrom (0,1 A) |
+| MPPT | `edf7` / `edf6` | Absorptions- / Erhaltungsspannung (0,01 V) |
+| MPPT | `104f` | Historie gesamt |
+| MPPT | `1050` … `106e` | Historie heute … vor 30 Tagen |
+
+Antwort `Flags 01 [Register unbekannt]` = das Gerät kennt das Register nicht.
+
+#### Testfunktion (wird vor der Fertigstellung entfernt)
+
+| Befehl | Wirkung |
+|---|---|
+| `absturz` | löst **absichtlich einen Absturz** aus. Das Gerät startet neu, **alle Relais fallen ab**. Dient zum Testen des Neustart-Grunds (Reiter *Fehler*) und des automatischen Rückfalls nach einem Update (dreimal innerhalb von 60 s nach dem Start). |

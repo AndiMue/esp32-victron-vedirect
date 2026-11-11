@@ -67,4 +67,9 @@ void VeDirectReader::flush()
         m_serial.read();
     }
 }
+
+void VeDirectReader::write(const char* text, std::size_t length)
+{
+    m_serial.write(reinterpret_cast<const uint8_t*>(text), length);
+}
 #endif // ARDUINO
