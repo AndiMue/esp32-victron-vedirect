@@ -1,6 +1,6 @@
 # Bedienungsanleitung – VE.Direct Steuergerät
 
-> **Stand:** 11.11.2026, Firmware und WebUI ab `26.11.11-1705`
+> **Stand:** 11.11.2026, Firmware und WebUI ab `26.11.11-1803`
 > **Status:** Entwurf, wächst mit jeder Entwicklungsstufe mit.
 > Abschnitte mit *„folgt“* sind noch nicht umgesetzt.
 
@@ -68,7 +68,7 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
 | **Historie** | Historienwerte von Shunt und MPPT (z. B. tiefste Entladung, Ertrag gesamt) und die **MPPT-Historie der letzten 30 Tage** (Kapitel 3.4) |
 | **Fehler** | aktive Fehler, Gerätemeldungen, letzter Neustart, Ereignisliste (Kapitel 3.3) |
 | **Einstellungen** | Unterreiter **Steuerung** (Relais-Schwellen und Anlage, Kapitel 7.4 und 7.5), **Shunt** und **MPPT** (Geräteeinstellungen, nur Anzeige, Kapitel 3.5) |
-| **System** | Unterreiter **Info** (Netzwerk, MQTT, Versionen, Laufzeit, freier Speicher), **WLAN** (Kapitel 4), **MQTT** (Kapitel 9), **Gerät** (Passwort, Neustart, Kapitel 5), **Update** (Kapitel 8) |
+| **System** | Unterreiter **Info** (Netzwerk, MQTT, Versionen, Uhrzeit, Laufzeit, freier Speicher), **WLAN** (Kapitel 4), **MQTT** (Kapitel 9), **Gerät** (Passwort Kapitel 5, Uhr Kapitel 3.6, Neustart), **Update** (Kapitel 8) |
 
 ### 3.2 Anzeigen und Aktualisierung
 
@@ -85,16 +85,18 @@ Das Steuergerät liest einen **Victron SmartShunt** und einen **Victron SmartSol
 
 - **Aktive Fehler** mit Schwere: *kritisch* (rot), *Warnung* (orange), *Info* (grau). Ohne Fehler: „✓ Keine aktiven Fehler“. Liste der möglichen Fehler: Anhang 11.2.
 - **Meldungen der Geräte:** Fehlertext des MPPT und Alarmgrund des Shunts (nur bei Batteriealarm).
-- **Letzter Neustart:** Grund und Laufzeit seither. *Absturz*, *Watchdog* und *Unterspannung* sind rot markiert: Das Gerät ist ungeplant neu gestartet, die Relais waren dabei kurz aus.
-- **Ereignisliste:** die letzten 50 Ereignisse, neueste oben, mit „vor x min“ (die Uhrzeit folgt mit der Echtzeituhr). Erfasst werden:
+- **Letzter Neustart:** Grund und Laufzeit seither, bei gestellter Uhr mit Startzeitpunkt („seit …“). *Absturz*, *Watchdog* und *Unterspannung* sind rot markiert: Das Gerät ist ungeplant neu gestartet, die Relais waren dabei kurz aus.
+- **Ereignisliste:** die letzten 50 Ereignisse, neueste oben, mit **Datum und Uhrzeit** (beim Darüberfahren: „vor …“). Ist die Uhr nicht gestellt, steht dort „vor x min“. Auch Ereignisse von vor dem Stellen der Uhr (z. B. der Start) erhalten nachträglich die richtige Zeit. Erfasst werden:
   - Gerät gestartet (mit Grund und Firmware), Rückfall auf die vorherige Firmware
   - Victron-Gerät erkannt, gewechselt oder ausgefallen
   - Relais EIN/AUS mit Quelle (WebUI, MQTT, lokal) bzw. Grund; eine automatische Abschaltung ist eine Warnung
   - abgelehnte oder gespeicherte Schaltbefehle, Override ein/aus
   - Fehler aufgetreten / behoben (erst ab 10 s nach dem Start, vorher werden die Geräte noch erkannt)
   - geänderte Relais-Einstellungen, Zurücksetzen auf Voreinstellung, Anlagenwechsel
+  - Uhr per NTP gestellt bzw. vom Browser übernommen, geänderte Uhr-Einstellungen (Kapitel 3.6)
 - Die Ereignisliste liegt im Arbeitsspeicher und ist nach einem Neustart leer (bis auf den Start selbst).
 - Antwortet ein Victron-Gerät nicht auf Leseanfragen (Kapitel 3.4), steht dort die Info „Gerät antwortet nicht auf HEX-Anfragen“.
+- **Reaktionszeit:** Wird ein Gerät abgezogen, erscheint der Fehler nach ca. 5–7 s auf dem Display und nach ca. 5–8 s in der WebUI (je nach Aktualisierungstakt). Die Wartezeit von 5 s verhindert Fehlalarme bei einzelnen verlorenen Datenblöcken.
 
 ### 3.4 MPPT-Historie (Reiter „Historie“, letzte 30 Tage)
 
@@ -128,7 +130,28 @@ Gelesen wird beim Öffnen des Unterreiters und mit **„Neu einlesen“**.
 | Strom-Schwellwert | Lastausgang (nur bei Modellen mit Lastausgang) |
 | Durchschnittliche Restlaufzeit | |
 | Entladungsboden | |
-- **Reaktionszeit:** Wird ein Gerät abgezogen, erscheint der Fehler nach ca. 5–7 s auf dem Display und nach ca. 5–8 s in der WebUI (je nach Aktualisierungstakt). Die Wartezeit von 5 s verhindert Fehlalarme bei einzelnen verlorenen Datenblöcken.
+
+### 3.6 Uhr (System → Gerät → Uhr)
+
+Das Gerät hat eine **Echtzeituhr (RTC)**. Sie sorgt für Datum und Uhrzeit in der Ereignisliste, unter *System → Info* und in der MPPT-Historie.
+
+**Die Uhr stellt sich selbst:**
+1. Beim Einschalten aus der Echtzeituhr (wenn diese eine gültige Zeit hat).
+2. Per **Internet (NTP)**, sobald das Gerät mit einem WLAN mit Internet verbunden ist, danach **einmal täglich**. Die Echtzeituhr wird dabei nachgestellt.
+3. Hat das Gerät gar keine gültige Zeit (z. B. Camper ohne Internet und Echtzeituhr ohne Knopfzelle nach einem Stromausfall), übernimmt es beim Öffnen der Weboberfläche automatisch die **Uhrzeit des Handys bzw. PCs**.
+
+**Einstellungen:**
+
+| Einstellung | Bedeutung | Standard |
+|---|---|---|
+| Zeitzone | Anzeige in Ortszeit; Sommer-/Winterzeit wird automatisch umgestellt. Auswahl u. a. Deutschland, UTC, Großbritannien, Portugal, Osteuropa | Deutschland (MEZ/MESZ) |
+| NTP-Server | Zeitserver im Internet; Vorschlag aus der Liste oder eigener Name/IP (z. B. `fritz.box`) | `pool.ntp.org` |
+
+Angezeigt werden außerdem die aktuelle Uhrzeit, wie sie zuletzt gestellt wurde (Echtzeituhr, Internet, Browser) und der Zustand der **Knopfzelle**.
+
+**Knopfzelle:** Die Echtzeituhr braucht eine Knopfzelle **CR1220**. Ohne sie läuft die Uhr nur, solange das Gerät Strom hat. Nach einem Stromausfall ist die Zeit dann weg, bis sie neu gestellt wird (Internet bzw. Browser). Hinweis „Knopfzelle fehlt/schwach“ → Knopfzelle einsetzen bzw. tauschen.
+
+Intern läuft die Uhr in UTC; Zeitzone und Sommerzeit werden nur bei der Anzeige berücksichtigt. Genauigkeit der Echtzeituhr: etwa ±2 s pro Tag (wird per NTP täglich korrigiert).
 
 ---
 
@@ -402,6 +425,8 @@ Mögliche Ergebnisse: „ausgeführt“, „gespeichert, wird bei ausreichendem 
 | Relais schaltet unerwartet ab | Reiter *Fehler* → Ereignisliste zeigt den Grund (z. B. „SOC unter Abschaltschwelle“) |
 | Historie/Geräteeinstellungen: „antwortet nicht auf HEX-Anfragen“ | Die Leitung vom Steuergerät **zum** Victron-Gerät (TX) fehlt oder ist vertauscht; Live-Werte kommen trotzdem, weil sie nur in die andere Richtung laufen. Kabel prüfen. Simulatoren, die nur Text senden, antworten nie. |
 | Passwort vergessen | Reset-Taste (Kapitel 5) |
+| Uhrzeit „nicht gestellt“ oder falsch | *System → Gerät → Uhr*: Zeitzone prüfen; ohne Internet: Weboberfläche einmal öffnen (Browserzeit wird übernommen, wenn keine gültige Zeit vorhanden ist); Knopfzelle CR1220 einsetzen, damit die Zeit Stromausfälle übersteht |
+| Uhr: „Echtzeituhr nicht gefunden“ | Verkabelung der RTC prüfen (SDA GPIO 21, SCL GPIO 22, 3,3 V, GND); Zeit kommt dann nur per Internet bzw. Browser |
 
 ### 10.1 Notweg: WebUI per USB neu aufspielen
 
@@ -420,6 +445,8 @@ Einstellungen (WLAN, Passwort, MQTT, Relais, Anlage) bleiben dabei erhalten; sie
 
 ### 11.1 Technische Daten
 *folgt* (Versorgung, Anschlüsse, Pinbelegung siehe `Claude.md`)
+
+**Echtzeituhr:** Adafruit PCF8523 (ADA3295), I²C-Adresse 0x68, Versorgung 3,3 V. Anschluss: VIN → 3,3 V, GND → GND, SDA → GPIO 21, SCL → GPIO 22 (SQW frei). Knopfzelle CR1220. Ein Umstieg auf eine genauere Uhr (z. B. DS3231) ist in der Software vorbereitet.
 
 ### 11.2 Fehlerwort (`faults`)
 | Bit | Wert | Fehler | Schwere |
@@ -500,6 +527,15 @@ Nützliche Register (Werte als Rohzahl, Umrechnung in Klammern):
 | MPPT | `1050` … `106e` | Historie heute … vor 30 Tagen |
 
 Antwort `Flags 01 [Register unbekannt]` = das Gerät kennt das Register nicht.
+
+#### Echtzeituhr (W4e)
+
+| Befehl | Wirkung |
+|---|---|
+| `uhr` | Systemzeit (Ortszeit), Quelle (RTC/NTP/Browser), Zeitzone, NTP-Server; dazu RTC-Zeit (UTC), Unix-Zeit, Zustand der Knopfzelle. Sucht die RTC erneut, falls sie beim Start fehlte |
+| `uhr stellen JJJJ-MM-TT hh:mm:ss` | RTC stellen, **in UTC** (MEZ = UTC + 1 h, MESZ = UTC + 2 h), z. B. `uhr stellen 2026-11-11 16:45:00` |
+
+Normalerweise stellt sich die Uhr selbst (NTP bzw. Browser, folgt). `uhr stellen` ist nur zum Testen gedacht.
 
 #### Testfunktion (wird vor der Fertigstellung entfernt)
 

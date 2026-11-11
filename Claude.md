@@ -213,7 +213,7 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
 | E-Paper SCK / DIN | 18 / 23 (VSPI) |
 | E-Paper CS / DC / RST | 5 / 13 / 4 |
 | E-Paper BUSY | 34 (reiner Eingang) |
-| I²C Reserve | 21 SDA, 22 SCL |
+| I²C (RTC PCF8523, 0x68, seit W4e) | 21 SDA, 22 SCL |
 | Reset Btn | 35 | Pull high -> Btn schaltet auf Gnd
 | Reserve Eingänge | 36, 39 (externer Pull-up nötig; 36/39 analog) |
 | Nicht verwenden | 0, 2, 12, 14, 15 (Strapping/Bootsignale) |
@@ -383,7 +383,35 @@ Maßgeblich sind das aktuelle Projektziel, der tatsächliche Quellcode und die o
     - **W4c bleibt leer** (Projektinhaber 09.11.2026). Reserviert für: **HEX-Schreiben am MPPT**, falls später doch gewünscht. Derzeit MPPT nur lesen, Einstellungen über VictronConnect.
     - **MPPT-Einstellungen nur lesen**, schreiben nur über VictronConnect (NVM-Verschleiß, Ladespannung kann LiFePO4 schädigen).
     - **W4d** Shunt-Einstellungen: separat entscheiden; evtl. nur wenige Befehle (z. B. Historie löschen `0x1030`, SOC synchronisieren `0x102C`) mit Bestätigung.
+      - **⏭ ÜBERSPRUNGEN (Projektinhaber 11.11.2026), als späteres Ausbaupotenzial vorgemerkt.** Begründung: Die vorhandene BMV-700-Doku (Rev 7) nennt für die Befehle `0x102C` (SOC synchronisieren), `0x1030` (Historie löschen), `0x1029` (Nullstromkalibrierung), `0x0004` (Werkseinstellungen) nur die Register („write only“), **ohne Datentyp, Wert und Antwort**; kein Befehls-Beispiel; SmartShunt-Abweichungen von der BMV-Doku möglich (siehe 0x1001). Risiken: Historie löschen nicht umkehrbar; falsches SOC-Synchronisieren täuscht der SOC-Relaissteuerung einen vollen Akku vor (Tiefentladung, nur noch BMS als Schutz); Nullstromkalibrierung unter Last speichert dauerhaft falschen Nullpunkt; Werkseinstellungen nie einbauen. Nutzen gering, da alles in VictronConnect vorhanden. Gerät bleibt bis dahin **nur lesend**.
+      - **TODO vor einer späteren Umsetzung:** (1) **neuere Victron-Doku** speziell für den SmartShunt suchen (HEX-Protokoll, aktuelle Revision); (2) **Umsetzungen im Netz** suchen (erprobte Open-Source-Projekte, die diese Befehle an SmartShunt/BMV senden) und Format/Antwort daraus ableiten; (3) erst dann Vorschlag mit Sicherheitsabfragen; höchstens „Historie löschen“ und ggf. „SOC synchronisieren“, nie „Werkseinstellungen“.
     - **W4e oder W5:** Echtzeituhr (RTC/NTP), danach Meldungen mit Uhrzeit.
+    - **W4e Festlegungen (Projektinhaber 11.11.2026):**
+      - Hardware: **Adafruit PCF8523** (ADA3295), I²C 0x68, 3,3 V, an GPIO 21 (SDA) / 22 (SCL). Knopfzelle **CR1220** noch nicht vorhanden (ohne: Zeit nach Stromausfall weg). Genauigkeit ±2 s/Tag.
+      - **Eigener Minitreiber** statt Adafruit RTClib (zu groß). Als **eigene, projektneutrale Bibliothek** `lib/RtcPcf8523` (nur `Wire`), später separat vermarktbar. Datums-/BCD-Logik ohne Arduino → PC-Tests.
+      - **Umstieg auf bessere RTC vorhalten** (z. B. DS3231): gemeinsame Schnittstelle `HardwareRtc`; Chip per Einstellung wählen (beide Adresse 0x68, keine Automatik).
+      - **RTC läuft in UTC**, Umrechnung erst bei der Anzeige. **Zeitzone einstellbar** (Standard Deutschland MEZ/MESZ, Auswahl u. a. UTC).
+      - **NTP:** nach WLAN-Verbindung, dann **1× pro Tag**; danach RTC nachstellen. Server Standard **`pool.ntp.org`, andere auswählbar**.
+      - **Browserzeit:** automatisch nur, wenn keine gültige Zeit vorhanden; **kein Knopf**.
+      - **Nicht** aufs E-Paper (voll), **kein** MQTT-Zeitfeld.
+      - Anzeige: Ereignisliste mit Datum/Uhrzeit, System → Info (Zeit + Quelle), MPPT-Historie mit Datum.
+    - **W4e Schritt 1 (11.11.2026, umgesetzt):** `lib/RtcPcf8523`: `RtcTime` (DateTime UTC, Schaltjahr, Wochentag, Unix ↔ Datum 2000–2099, BCD), `HardwareRtc` (Schnittstelle: begin/read/write/batteryLow/name), `Pcf8523` (Codec ohne Arduino + I²C-Klasse; begin(): STOP aus, 24 h, **Control_3 PM=000 → Umschaltung auf Knopfzelle an (ab Werk aus!)**; read() ungültig bei OS-Flag). Tests `test/test_rtc` (12).
+    - **W4e Schritt 2 (11.11.2026, umgesetzt, Test offen):** `26.11.11-1745`. `Wire.begin(21, 22)` und `g_rtc.begin()` in `setup()` mit Ausgabe im Monitor; Monitor-Befehle `uhr`, `uhr stellen JJJJ-MM-TT hh:mm:ss` (UTC) → Anleitung 11.3. Eingabepuffer Monitor 32 → 48 Zeichen. I²C vorerst nur aus setup()/Logger-Task.
+      - Test Projektinhaber 11.11.2026 ✓: RTC gefunden, stellen, läuft weiter, Neustart (ohne Stromlos) behält Zeit.
+    - **W4e Schritt 3 (11.11.2026, umgesetzt, Test offen): NTP, Zeitzone, Browserzeit** (`26.11.11-1758`).
+      - `lib/RtcPcf8523/RtcZones`: Zeitzonen (Deutschland Standard, UTC, GB, Portugal, Osteuropa; POSIX-TZ inkl. EU-Sommerzeit), NTP-Vorschläge (pool.ntp.org Standard, de.pool.ntp.org, ptbtime1.ptb.de, fritz.box, time.google.com), `isValidHostName`. Tests: test_rtc 14.
+      - main.cpp Uhrdienst: Systemuhr in UTC; beim Start aus gültiger RTC; `startNtp()` in der webTask (`configTzTime`, Intervall 24 h, Callback setzt nur Merker; SNTP hält nur den Zeiger auf den Server → fester Puffer `g_ntpServer`, vor Änderung `sntp_stop()`); `clockLoop()` übernimmt den Abgleich und stellt die RTC nach (Ereignis nur beim Quellenwechsel, nicht täglich); Browserzeit `POST /api/time` nur, wenn keine gültige Zeit (< 2024-01-01). `g_i2cMutex` (+ `I2cLock`) für die RTC aus webTask und Logger-Task.
+      - NVS `clock/tz`, `clock/ntp`. API: `GET/POST /api/clock` (tz, ntp), `POST /api/time` (unix). `/api/status` enthält `clock.valid` → WebUI schickt einmal pro Seitenaufruf die Browserzeit, wenn ungültig.
+      - WebUI *System → Gerät → Uhr*: Uhrzeit, Quelle (mit Alter), RTC/Knopfzelle, Zeitzone (Auswahl), NTP-Server (Eingabe mit Vorschlagsliste).
+      - Monitor `uhr` zeigt zusätzlich Systemzeit, Quelle, Zeitzone, NTP-Server.
+      - Test Projektinhaber 11.11.2026 ✓ (NTP, Zeitzone, Server). **Browserzeit ungetestet.**
+    - **W4e Schritt 4 (11.11.2026, umgesetzt, Test offen): Datum/Uhrzeit in der Anzeige** (`26.11.11-1803`).
+      - Ereignisliste: Zeitpunkt = jetzt (Uhr) − Alter (millis) → **auch Ereignisse vor dem Stellen der Uhr** (z. B. Start) erhalten die richtige Zeit; EventLog unverändert. `/api/faults`: `events[].time`, `bootTime` (null ohne gültige Uhr → weiter „vor x min“).
+      - `/api/status` → `clock{valid, local, source}`; *System → Info*: Zeile „Uhrzeit“ mit Quelle. Reiter *Fehler*: Laufzeit „(seit …)“.
+      - MPPT-Historie: `/api/hex` → `today{y,m,d}` (Ortszeit des Geräts); Tage als „heute, 11.11.“, „gestern, 10.11.“, „Mo 09.11.“ (Hinweis: MPPT-„Tag“ = Solartag des Geräts, ungefähr Kalendertag).
+      - Test Projektinhaber 11.11.2026: „perfekt“ ✓.
+    - **W4e Schritt 5 (11.11.2026): Abschluss.** Bedienungsanleitung auf `26.11.11-1803`: neues **Kapitel 3.6 Uhr** (Quellen, Einstellungen, Knopfzelle CR1220, UTC intern), Ereignisliste mit Datum/Uhrzeit (3.3, dabei verrutschten Punkt „Reaktionszeit“ zurück nach 3.3), *System*-Unterreiter (Info mit Uhrzeit, Gerät mit Uhr), Fehlerbehebung (Uhr nicht gestellt / RTC nicht gefunden), Anhang 11.1 RTC-Anschluss, 11.3 Monitor `uhr`. Pinbelegung: I²C jetzt RTC.
+    - **✅ W4e ABGESCHLOSSEN (11.11.2026).** Offen: **Browserzeit ungetestet** (Test: ohne Knopfzelle stromlos, dann nur AP ohne Internet, WebUI öffnen). Später: Knopfzelle CR1220 besorgen; ggf. DS3231 als zweite `HardwareRtc`-Klasse; Bibliothek `lib/RtcPcf8523` ggf. separat veröffentlichen (Lizenz klären).
   - Quellen HEX: `docs/VeDirect-Doku/Victron_BlueSolar-SmartSolar-MPPT-HEX-protocol_Rev18.pdf`, `docs/VeDirect-Doku/Victron_BMV-7xx-SmartShunt-HEX-protocol_Rev7.pdf` (BMV-700-Doku; SmartShunt-Abweichungen am Gerät prüfen).
 - **Test 09.11.2026 (Projektinhaber): SmartShunt auf FW 4.20 geflasht** während des Betriebs. Verhalten wie festgelegt: Wechselrichter (R1, war EIN) fiel ab, SOC und Strom „--“, Spannung ca. 13,45 V mit `*` (Ersatzwert vom MPPT), Warndreieck kritisch. ✓
 - **E-Paper mit Symbolen (umgesetzt 08.11.2026):** Symbolleiste: WLAN-Balken (4 Stufen nach RSSI, durchgestrichen ohne WLAN), AP (schwarz = an, durchgestrichen = aus), MQTT (nur bei WLAN + eingerichtetem MQTT, ab W3), OVR (nur bei Override), Warndreieck (gefüllt = kritisch, leer = Warnung). Lade-/Entladepfeil am SOC (▲ lädt, ▼ entlädt, o Ruhe bei |I| < 0,05 A). Untere Zeile: Shunt/MPPT ● ok, ◐ instabil, ⊗ defekt. Textliche Statuszeile entfällt (Details → WebUI). Sofort aktualisiert: Symbole/Zustände/Relais; WLAN-Balken und Pfeil im 30-s-Takt mit den Werten.

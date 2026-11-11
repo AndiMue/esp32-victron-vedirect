@@ -245,6 +245,7 @@
         <dl class="grid">
           <dt>Firmware</dt>       <dd id="stFw">–</dd>
           <dt>WebUI</dt>          <dd id="stWebui">–</dd>
+          <dt>Uhrzeit</dt>        <dd id="stClock">–</dd>
           <dt>Laufzeit</dt>       <dd id="stUptime">–</dd>
           <dt>Freier Speicher</dt><dd id="stHeap">–</dd>
         </dl>
@@ -350,6 +351,26 @@
           <label class="check small"><input type="checkbox" data-show="pwCurrent,pwNew,pwNew2"> Passwörter anzeigen</label>
           <button type="submit">Passwort ändern</button>
         </form>
+
+        <h2>Uhr</h2>
+        <dl class="grid">
+          <dt>Uhrzeit</dt>     <dd id="clkNow">–</dd>
+          <dt>Gestellt per</dt> <dd id="clkSource">–</dd>
+          <dt>Echtzeituhr</dt> <dd id="clkRtc">–</dd>
+        </dl>
+        <form id="clockForm">
+          <label>Zeitzone
+            <select id="clkTz"></select>
+          </label>
+          <label>NTP-Server (Zeitserver im Internet)
+            <input id="clkNtp" list="clkServers" maxlength="63" required>
+            <datalist id="clkServers"></datalist>
+            <small>Standard: pool.ntp.org. Auswahl aus der Liste oder eigener Name/IP, z. B. fritz.box.</small>
+          </label>
+          <button type="submit">Speichern</button>
+        </form>
+        <p class="hint">Die Uhr stellt sich selbst: per NTP, sobald das Gerät Internet hat (danach einmal täglich),
+          sonst aus der Echtzeituhr. Hat das Gerät gar keine gültige Zeit, übernimmt es die Uhrzeit dieses Browsers.</p>
 
         <h2>Neustart</h2>
         <button id="restartBtn" class="secondary">Gerät neu starten</button>

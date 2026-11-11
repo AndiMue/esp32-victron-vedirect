@@ -72,6 +72,7 @@ function showSubIn(tab, name) {
   section.querySelectorAll(".subpanel").forEach((p) => p.classList.toggle("hidden", p.id !== "sub-" + name));
   if (name === "wifi") loadWifi();
   if (name === "mqtt") loadMqtt();
+  if (name === "device") loadClock();
   if (name === "control") loadSettings();
   if (name === "shuntset") readHex("shunt");
   if (name === "mpptset") readHex("mppt");
@@ -145,6 +146,12 @@ async function refreshStatus() {
     $("stHeap").textContent = Math.round(s.freeHeap / 1024) + " KB";
     $("pwWarning").classList.toggle("hidden", !s.defaultPassword);
     showFaultSummary(s.faults);
+    sendBrowserTimeIfNeeded(s.clock);
+    if (s.clock) {
+      $("stClock").textContent = s.clock.valid
+        ? s.clock.local + " (" + (clockSourceText[s.clock.source] || s.clock.source) + ")"
+        : "nicht gestellt";
+    }
   } catch (e) {
     $("stState").textContent = "Keine Verbindung zum Gerät";
   }
@@ -424,10 +431,12 @@ async function refreshFaults() {
     if (f.batteryAlarm) dev.push(["Shunt-Alarm", f.batteryAlarm]);
     $("ftDevice").innerHTML = grid(dev);
     $("ftReset").innerHTML = sevPill(f.reset.severity) + " " + escapeHtml(f.reset.text);
-    $("ftUptime").textContent = formatUptime(f.uptimeS);
+    $("ftUptime").textContent = formatUptime(f.uptimeS) + (f.bootTime ? " (seit " + f.bootTime + ")" : "");
     $("ftEvents").innerHTML = f.events.length
       ? f.events.map((e) =>
-          '<tr><td class="when">' + formatAgo(e.ageS) + "</td><td>" + sevPill(e.severity) +
+          // W4e: mit gültiger Uhr Datum/Uhrzeit (Zeitpunkt beim Darüberfahren: "vor …")
+          '<tr><td class="when"' + (e.time ? ' title="' + formatAgo(e.ageS) + '">' + e.time : ">" + formatAgo(e.ageS)) +
+          "</td><td>" + sevPill(e.severity) +
           "</td><td>" + escapeHtml(e.text) + "</td></tr>").join("")
       : '<tr><td class="muted">Keine Ereignisse.</td></tr>';
   } catch (e) {
@@ -617,10 +626,20 @@ function fmtKWh(v) { return v === null || v === undefined ? "–" : num(v, 2) + 
 function fmtV(v)   { return v === null || v === undefined ? "–" : num(v, 2) + " V"; }
 function fmtMin(m) { return m >= 60 ? Math.floor(m / 60) + " h " + (m % 60) + " min" : m + " min"; }
 
-function dayLabel(ago) {
-  if (ago === 0) return "heute";
-  if (ago === 1) return "gestern";
-  return "vor " + ago + " Tagen";
+/// Historientag als Text. today = {y, m, d} des Geräts (nur bei gültiger Uhr),
+/// dann mit Wochentag und Datum, z. B. "Mo 09.11.".
+function dayLabel(ago, today) {
+  if (!today) {
+    if (ago === 0) return "heute";
+    if (ago === 1) return "gestern";
+    return "vor " + ago + " Tagen";
+  }
+  const dt = new Date(today.y, today.m - 1, today.d - ago);   // reine Kalenderrechnung
+  const wd = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"][dt.getDay()];
+  const date = String(dt.getDate()).padStart(2, "0") + "." + String(dt.getMonth() + 1).padStart(2, "0") + ".";
+  if (ago === 0) return "heute, " + date;
+  if (ago === 1) return "gestern, " + date;
+  return wd + " " + date;
 }
 
 const hexStateText = {
@@ -680,7 +699,7 @@ function renderMpptHistory(h) {
   $("hxChart").innerHTML = days.map((d) => {
     const v = d.state === "ok" ? d.yieldKWh : 0;
     const pct = Math.round((v / max) * 100);
-    const tip = dayLabel(d.ago) + ": " + (d.state === "ok" ? fmtKWh(v) : (hexStateText[d.state] || d.state));
+    const tip = dayLabel(d.ago, h.today) + ": " + (d.state === "ok" ? fmtKWh(v) : (hexStateText[d.state] || d.state));
     return '<div class="bar' + (d.state === "ok" ? "" : " empty") + '" title="' + escapeHtml(tip) +
       '"><span style="height:' + pct + '%"></span></div>';
   }).join("") + '<div class="barlabels"><span>vor 30 Tagen</span><span>max. ' + fmtKWh(max) + "</span><span>heute</span></div>";
@@ -690,10 +709,10 @@ function renderMpptHistory(h) {
     "<th>Bulk / Abs. / Erh.</th><th>Fehler</th></tr>";
   $("hxDays").innerHTML = head + h.history.days.map((d) => {
     if (d.state !== "ok") {
-      return '<tr class="stale"><td>' + dayLabel(d.ago) + '</td><td colspan="5">' +
+      return '<tr class="stale"><td>' + dayLabel(d.ago, h.today) + '</td><td colspan="5">' +
         escapeHtml(hexStateText[d.state] || d.state) + "</td></tr>";
     }
-    return "<tr><td>" + dayLabel(d.ago) + "</td><td>" + fmtKWh(d.yieldKWh) + "</td><td>" + d.powerMaxW + " W</td>" +
+    return "<tr><td>" + dayLabel(d.ago, h.today) + "</td><td>" + fmtKWh(d.yieldKWh) + "</td><td>" + d.powerMaxW + " W</td>" +
       "<td>" + num(d.batteryMinV, 2) + "–" + num(d.batteryMaxV, 2) + " V</td>" +
       "<td>" + fmtMin(d.bulkMin) + " / " + fmtMin(d.absorptionMin) + " / " + fmtMin(d.floatMin) + "</td>" +
       '<td class="' + (d.errors.length ? "err" : "") + '">' + (d.errors.length ? escapeHtml(d.errors.join(", ")) : "–") + "</td></tr>";
@@ -738,6 +757,63 @@ function renderHexSettings(role, h) {
 
 document.querySelectorAll("button.hexreload").forEach((b) => {
   b.addEventListener("click", () => readHex(b.dataset.role));
+});
+
+// ---------------------------------------------------------------------------
+// W4e: Uhr. Zustand als Eigenschaften an Funktionen (siehe readHex), weil
+// refreshStatus()/showSubIn() schon beim Laden der Datei laufen.
+// ---------------------------------------------------------------------------
+const clockSourceText = {
+  none: "noch nicht gestellt",
+  rtc: "Echtzeituhr (RTC)",
+  ntp: "Internet (NTP)",
+  browser: "Uhrzeit des Browsers",
+};
+
+/// Hat das Gerät keine gültige Zeit, einmal pro Seitenaufruf die Browserzeit
+/// schicken (Projektinhaber: automatisch, kein Knopf).
+function sendBrowserTimeIfNeeded(clock) {
+  if (!clock || clock.valid || sendBrowserTimeIfNeeded.sent) return;
+  sendBrowserTimeIfNeeded.sent = true;
+  api("/api/time", { unix: Math.floor(Date.now() / 1000) })
+    .then((r) => { if (r.applied) toast("Uhrzeit des Geräts wurde vom Browser übernommen."); })
+    .catch(() => { sendBrowserTimeIfNeeded.sent = false; });
+}
+
+function formatDuration(s) {
+  if (s === null || s === undefined) return "";
+  return " (" + formatAgo(s) + ")";
+}
+
+function showClock(c) {
+  $("clkNow").textContent = c.valid ? c.local : "nicht gestellt";
+  $("clkSource").textContent = (clockSourceText[c.source] || c.source) + (c.valid ? formatDuration(c.setAgoS) : "");
+  $("clkRtc").textContent = c.rtc.found
+    ? c.rtc.chip + (c.rtc.batteryLow ? " – Knopfzelle fehlt/schwach (Zeit geht bei Stromausfall verloren)" : " – Knopfzelle ok")
+    : "nicht gefunden";
+  $("clkTz").innerHTML = c.zones.map((z) => '<option value="' + escapeHtml(z.key) + '">' + escapeHtml(z.label) + "</option>").join("");
+  $("clkTz").value = c.tz;
+  $("clkServers").innerHTML = c.servers.map((s) => '<option value="' + escapeHtml(s) + '">').join("");
+  $("clkNtp").value = c.ntp;
+}
+
+async function loadClock() {
+  try {
+    showClock(await api("/api/clock"));
+  } catch (e) {
+    toast("Uhr: " + e.message, true);
+  }
+}
+
+$("clockForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    const r = await api("/api/clock", { tz: $("clkTz").value, ntp: $("clkNtp").value.trim() });
+    toast("Uhr: " + r.result, !r.ok);
+    showClock(r.clock);
+  } catch (e) {
+    toast("Uhr: " + e.message, true);
+  }
 });
 
 // Start: sofort einmal alles holen, dann im gewählten Takt

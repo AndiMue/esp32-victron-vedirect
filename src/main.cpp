@@ -55,6 +55,12 @@
 #include "WebUi.hpp"
 #include "WifiManager.hpp"
 
+#include <Wire.h>
+#include <sys/time.h>
+#include "esp_sntp.h"       // W4e: NTP (im ESP32-Framework enthalten)
+#include "Pcf8523.hpp"      // W4e: RTC-Minitreiber (lib/RtcPcf8523)
+#include "RtcZones.hpp"
+
 #include "AppConfig.hpp"
 #include "DeviceCatalog.hpp"
 #include "DeviceDetector.hpp"
@@ -322,6 +328,178 @@ const char* resetReasonText(esp_reset_reason_t reason, Severity& severity)
 }
 
 esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;   ///< in setup() gesetzt
+
+/******************************************************************************
+ * W4e: Echtzeituhr. Vorerst nur in setup() und der Logger-Task (Monitor-
+ * Befehl "uhr") benutzt; I²C ist nicht threadsicher.
+ ******************************************************************************/
+constexpr uint8_t RtcSdaPin = 21;
+constexpr uint8_t RtcSclPin = 22;
+Pcf8523 g_rtc(Wire);
+bool    g_rtcFound = false;
+
+/******************************************************************************
+ * W4e Schritt 3: Uhrdienst (Projektinhaber 11.11.2026)
+ *
+ *   - Systemuhr des ESP32 läuft in UTC; Anzeige über die Zeitzone (TZ).
+ *   - Stellen: beim Start aus der RTC; NTP nach WLAN-Verbindung, dann 1×/Tag;
+ *     Browserzeit NUR, wenn noch keine gültige Zeit vorhanden ist.
+ *   - Nach NTP/Browser wird die RTC nachgestellt.
+ *   - I²C (RTC) wird aus mehreren Tasks benutzt -> g_i2cMutex.
+ ******************************************************************************/
+const char* const NvsClock = "clock";
+
+enum class ClockSource : uint8_t { None = 0, Rtc = 1, Ntp = 2, Browser = 3 };
+
+SemaphoreHandle_t     g_i2cMutex = nullptr;          ///< in setup() angelegt
+std::atomic<uint8_t>  g_clockSource{0};               ///< ClockSource
+std::atomic<uint32_t> g_clockSetAtUnix{0};            ///< letzte Stellung (UTC)
+std::atomic<bool>     g_ntpSyncPending{false};        ///< SNTP-Callback -> webTask
+char   g_ntpServer[64] = "pool.ntp.org";  ///< SNTP merkt sich nur den Zeiger -> fester Puffer
+String g_tzKey         = "berlin";        ///< nur setup()/webTask
+
+constexpr uint32_t ClockValidAfterUnix = 1704067200UL;   ///< 2024-01-01: davor "nicht gestellt"
+constexpr uint32_t NtpIntervalMs       = 24UL * 3600UL * 1000UL;   ///< 1× pro Tag
+
+/// I²C-Sperre (RAII). Wartet höchstens 200 ms; ok() = Sperre erhalten.
+class I2cLock
+{
+public:
+    I2cLock() : m_ok(g_i2cMutex != nullptr && xSemaphoreTake(g_i2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {}
+    ~I2cLock() { if (m_ok) xSemaphoreGive(g_i2cMutex); }
+    bool ok() const { return m_ok; }
+    I2cLock(const I2cLock&) = delete;
+    I2cLock& operator=(const I2cLock&) = delete;
+private:
+    bool m_ok;
+};
+
+uint32_t clockNowUnix()  { return static_cast<uint32_t>(time(nullptr)); }
+bool     clockValid()    { return clockNowUnix() >= ClockValidAfterUnix; }
+
+const char* clockSourceKey(ClockSource s)
+{
+    switch (s)
+    {
+        case ClockSource::Rtc:     return "rtc";
+        case ClockSource::Ntp:     return "ntp";
+        case ClockSource::Browser: return "browser";
+        default:                   return "none";
+    }
+}
+
+/// Systemuhr stellen (UTC) und Quelle merken.
+void setSystemClock(uint32_t unix, ClockSource source)
+{
+    struct timeval tv;
+    tv.tv_sec  = static_cast<time_t>(unix);
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    g_clockSource.store(static_cast<uint8_t>(source));
+    g_clockSetAtUnix.store(unix);
+}
+
+/// RTC auf die aktuelle Systemzeit stellen (nach NTP/Browser).
+bool writeRtcFromSystem()
+{
+    if (!g_rtcFound)
+    {
+        return false;
+    }
+    Rtc::DateTime t;
+    if (!Rtc::fromUnix(clockNowUnix(), t))
+    {
+        return false;
+    }
+    I2cLock lock;
+    return lock.ok() && g_rtc.write(t);
+}
+
+/// Zeitzone anwenden (POSIX-Regel in die Umgebung der C-Bibliothek).
+void applyTimeZone()
+{
+    setenv("TZ", Rtc::timeZone(g_tzKey.c_str()).posix, 1);
+    tzset();
+}
+
+/// Einstellungen laden (setup(), vor dem Start der Tasks).
+void loadClockSettings()
+{
+    g_tzKey = SettingsStore::getString(NvsClock, "tz", "berlin");
+    const String server = SettingsStore::getString(NvsClock, "ntp", "pool.ntp.org");
+    if (Rtc::isValidHostName(server.c_str()))
+    {
+        std::strncpy(g_ntpServer, server.c_str(), sizeof(g_ntpServer) - 1);
+        g_ntpServer[sizeof(g_ntpServer) - 1] = '\0';
+    }
+    applyTimeZone();
+}
+
+/// SNTP meldet einen erfolgreichen Abgleich (läuft in der lwIP-Task:
+/// nur Merker setzen, kein I²C hier).
+void onNtpSync(struct timeval*)
+{
+    g_ntpSyncPending.store(true);
+}
+
+/// NTP (neu) starten. Nur aus der webTask, nachdem das WLAN gestartet ist.
+void startNtp()
+{
+    sntp_stop();   // Zeiger auf g_ntpServer darf beim Ändern nicht benutzt werden
+    sntp_set_time_sync_notification_cb(onNtpSync);
+    sntp_set_sync_interval(NtpIntervalMs);
+    configTzTime(Rtc::timeZone(g_tzKey.c_str()).posix, g_ntpServer);
+}
+
+/// In der webTask-Schleife: NTP-Ergebnis übernehmen (RTC nachstellen, Ereignis).
+void clockLoop()
+{
+    if (!g_ntpSyncPending.exchange(false))
+    {
+        return;
+    }
+    const ClockSource before = static_cast<ClockSource>(g_clockSource.load());
+    g_clockSource.store(static_cast<uint8_t>(ClockSource::Ntp));
+    g_clockSetAtUnix.store(clockNowUnix());
+    const bool rtcOk = writeRtcFromSystem();
+    if (before != ClockSource::Ntp)
+    {
+        // Nur beim Wechsel der Quelle melden, nicht bei jedem täglichen Abgleich
+        addEvent(Severity::Info, "Uhrzeit per NTP gestellt (%s)%s", g_ntpServer,
+                 g_rtcFound ? (rtcOk ? ", RTC nachgestellt" : ", RTC-Schreiben fehlgeschlagen") : "");
+    }
+}
+
+/// Browserzeit übernehmen – nur, wenn noch keine gültige Zeit vorhanden ist.
+/// true = übernommen.
+bool setClockFromBrowser(uint32_t unix)
+{
+    if (clockValid() || unix < ClockValidAfterUnix)
+    {
+        return false;
+    }
+    setSystemClock(unix, ClockSource::Browser);
+    const bool rtcOk = writeRtcFromSystem();
+    addEvent(Severity::Info, "Uhrzeit vom Browser übernommen (kein NTP/RTC)%s",
+             g_rtcFound ? (rtcOk ? ", RTC gestellt" : ", RTC-Schreiben fehlgeschlagen") : "");
+    return true;
+}
+
+/// Lokale Zeit als "TT.MM.JJJJ hh:mm:ss" (leer, wenn ungültig).
+String formatLocalTime(uint32_t unix)
+{
+    if (unix < ClockValidAfterUnix)
+    {
+        return String();
+    }
+    const time_t t = static_cast<time_t>(unix);
+    struct tm lt;
+    localtime_r(&t, &lt);
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%02d.%02d.%04d %02d:%02d:%02d", lt.tm_mday, lt.tm_mon + 1,
+                  lt.tm_year + 1900, lt.tm_hour, lt.tm_min, lt.tm_sec);
+    return String(buf);
+}
 
 /// Empfangspuffer der Logger-Task (global statt auf dem Stack).
 LogMessage g_incoming;
@@ -1328,6 +1506,7 @@ void webTask(void*)
     g_webUi.setMqtt(&g_mqtt);   // W3: MQTT-Reiter und /api/mqtt
     registerProjectApi();       // W4a: Projektseiten (/api/live, ...)
     g_webUi.begin(g_wifi, DeviceName, FirmwareVersion);
+    startNtp();   // W4e: SNTP wartet selbst, bis das WLAN Internet hat
 
     bool stableConfirmed = false;
 
@@ -1336,6 +1515,7 @@ void webTask(void*)
         const uint32_t now = millis();
         g_wifi.loop(now);
         g_webUi.loop(now);
+        clockLoop();   // W4e: NTP-Abgleich übernehmen, RTC nachstellen
 
         // W2: Nach 60 s stabilem Lauf gilt eine neue Firmware als gut
         // (sonst Rückfall auf die vorherige, siehe UpdateManager)
@@ -1608,7 +1788,56 @@ String buildStatusExtension()
         case Severity::Critical: severity = "critical"; break;
         default: break;
     }
-    return "\"faults\":{\"count\":" + String(count) + ",\"severity\":\"" + severity + "\"}";
+    // W4e: "clock.valid" -> die WebUI schickt die Browserzeit, wenn false
+    return "\"faults\":{\"count\":" + String(count) + ",\"severity\":\"" + severity + "\"}" +
+           ",\"clock\":{\"valid\":" + String(clockValid() ? "true" : "false") +
+           ",\"local\":" + WebUi::jsonString(formatLocalTime(clockNowUnix())) +   // leer, wenn ungültig
+           ",\"source\":\"" + clockSourceKey(static_cast<ClockSource>(g_clockSource.load())) + "\"}";
+}
+
+/******************************************************************************
+ * W4e Schritt 3: Uhr (System → Gerät → Uhr)
+ ******************************************************************************/
+String buildClockJson()
+{
+    bool batteryLow = false;
+    if (g_rtcFound)
+    {
+        I2cLock lock;
+        batteryLow = lock.ok() && g_rtc.batteryLow();
+    }
+    const uint32_t now   = clockNowUnix();
+    const uint32_t setAt = g_clockSetAtUnix.load();
+
+    String j;
+    j.reserve(900);
+    j  = "{\"valid\":"   + String(clockValid() ? "true" : "false");
+    j += ",\"local\":"   + WebUi::jsonString(formatLocalTime(now));
+    j += ",\"source\":\"" + String(clockSourceKey(static_cast<ClockSource>(g_clockSource.load()))) + "\"";
+    j += ",\"setAgoS\":" + (setAt >= ClockValidAfterUnix && now >= setAt ? String(now - setAt) : String("null"));
+    j += ",\"tz\":"      + WebUi::jsonString(Rtc::timeZone(g_tzKey.c_str()).key);
+    j += ",\"ntp\":"     + WebUi::jsonString(g_ntpServer);
+    j += ",\"rtc\":{\"found\":" + String(g_rtcFound ? "true" : "false");
+    j += ",\"chip\":"    + WebUi::jsonString(g_rtc.name());
+    j += ",\"batteryLow\":" + String(batteryLow ? "true" : "false") + "}";
+
+    std::size_t n = 0;
+    const Rtc::TimeZone* zones = Rtc::timeZones(n);
+    j += ",\"zones\":[";
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        if (i > 0) j += ",";
+        j += "{\"key\":" + WebUi::jsonString(zones[i].key) + ",\"label\":" + WebUi::jsonString(zones[i].label) + "}";
+    }
+    const char* const* servers = Rtc::ntpServers(n);
+    j += "],\"servers\":[";
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        if (i > 0) j += ",";
+        j += WebUi::jsonString(servers[i]);
+    }
+    j += "]}";
+    return j;
 }
 
 /******************************************************************************
@@ -1778,13 +2007,22 @@ String buildFaultsJson()
     j += ",\"pvError\":"      + (pvError.length() ? WebUi::jsonString(pvError) : String("null"));
     j += ",\"batteryAlarm\":" + (alarm.length()   ? WebUi::jsonString(alarm)   : String("null"));
 
+    // W4e Schritt 4: Mit gültiger Uhr echte Zeitpunkte. Die Ereignisse kennen
+    // nur die Laufzeit (millis); daraus wird zurückgerechnet. Das stimmt auch
+    // für Ereignisse, die VOR dem Stellen der Uhr lagen (z. B. der Start).
+    const bool     clockOk = clockValid();
+    const uint32_t nowUnix = clockNowUnix();
+    j += ",\"bootTime\":" + (clockOk ? WebUi::jsonString(formatLocalTime(nowUnix - now / 1000)) : String("null"));
+
     j += ",\"events\":[";
     for (size_t i = 0; i < g_webEventsCopy.size(); ++i)
     {
         const EventLog::Entry& e = g_webEventsCopy.newest(i);
+        const uint32_t ageS = DeviceState::ageMs(e.timeMs, now) / 1000;
         if (i > 0) j += ",";
         j += "{\"seq\":"       + String(e.seq);
-        j += ",\"ageS\":"      + String(DeviceState::ageMs(e.timeMs, now) / 1000);
+        j += ",\"ageS\":"      + String(ageS);
+        j += ",\"time\":"      + (clockOk ? WebUi::jsonString(formatLocalTime(nowUnix - ageS)) : String("null"));
         j += ",\"severity\":\"" + String(severityKey(e.severity)) + "\"";
         j += ",\"text\":"      + WebUi::jsonString(e.text);
         j += "}";
@@ -2219,6 +2457,16 @@ String buildHexJson(bool shunt)
     j += ",\"failed\":"    + String(r.failed);
     j += ",\"ageS\":"      + String(r.finished ? (now - r.finishedMs) / 1000 : 0);
     j += "}";
+    // W4e: heutiges Datum (Ortszeit des Geräts) -> WebUI zeigt die
+    // Historientage mit Datum statt "vor n Tagen"
+    if (clockValid())
+    {
+        const time_t t = static_cast<time_t>(clockNowUnix());
+        struct tm lt;
+        localtime_r(&t, &lt);
+        j += ",\"today\":{\"y\":" + String(lt.tm_year + 1900) + ",\"m\":" + String(lt.tm_mon + 1) +
+             ",\"d\":" + String(lt.tm_mday) + "}";
+    }
     j += ",\"settings\":" + buildSettingsListJson(shunt);
     if (!shunt)
     {
@@ -2289,6 +2537,59 @@ void registerProjectApi()
                        bool ok = false;
                        const String result = sendWebCommand(command, ok);
                        out = commandResponse(ok, result);
+                       return 200;
+                   });
+
+    // ---- W4e Schritt 3: Uhr ----
+    g_webUi.addApi("/api/clock", WebUi::Method::Get,
+                   [](const ApiRequest&, String& out) {
+                       out = buildClockJson();
+                       return 200;
+                   });
+
+    // Zeitzone und NTP-Server speichern und sofort anwenden
+    g_webUi.addApi("/api/clock", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       String tz = req.arg("tz");
+                       String ntp = req.arg("ntp");
+                       ntp.trim();
+                       if (std::strcmp(Rtc::timeZone(tz.c_str()).key, tz.c_str()) != 0)
+                       {
+                           out = "{\"ok\":false,\"error\":\"Unbekannte Zeitzone\"}";
+                           return 400;
+                       }
+                       if (!Rtc::isValidHostName(ntp.c_str()))
+                       {
+                           out = "{\"ok\":false,\"error\":\"NTP-Server: nur Name oder IP-Adresse (Buchstaben, Ziffern, Punkt, Bindestrich)\"}";
+                           return 400;
+                       }
+                       const bool okTz  = SettingsStore::putString(NvsClock, "tz", tz);
+                       const bool okNtp = SettingsStore::putString(NvsClock, "ntp", ntp);
+                       const bool ntpChanged = ntp != g_ntpServer;
+                       g_tzKey = tz;
+                       applyTimeZone();
+                       if (ntpChanged)
+                       {
+                           sntp_stop();   // vor dem Ändern des Puffers (SNTP hält nur den Zeiger)
+                           std::strncpy(g_ntpServer, ntp.c_str(), sizeof(g_ntpServer) - 1);
+                           g_ntpServer[sizeof(g_ntpServer) - 1] = '\0';
+                       }
+                       startNtp();    // neuer Server/Zeitzone, sofortiger Abgleich
+                       addEvent(Severity::Info, "Uhr-Einstellungen geändert: %s, NTP %s",
+                                Rtc::timeZone(g_tzKey.c_str()).label, g_ntpServer);
+                       out = "{\"ok\":" + String(okTz && okNtp ? "true" : "false") +
+                             ",\"result\":" + WebUi::jsonString(okTz && okNtp ? "gespeichert"
+                                                                     : "übernommen, aber Speichern im Flash fehlgeschlagen") +
+                             ",\"clock\":" + buildClockJson() + "}";
+                       return 200;
+                   });
+
+    // Browserzeit (automatisch von der WebUI, nur wenn keine gültige Zeit)
+    g_webUi.addApi("/api/time", WebUi::Method::Post,
+                   [](const ApiRequest& req, String& out) {
+                       const uint32_t unix = static_cast<uint32_t>(strtoul(req.arg("unix").c_str(), nullptr, 10));
+                       const bool applied = setClockFromBrowser(unix);
+                       out = "{\"ok\":true,\"applied\":" + String(applied ? "true" : "false") + "}";
                        return 200;
                    });
 
@@ -3189,7 +3490,7 @@ void printControlChanges(const ControlSnapshot& control)
  *
  * Quelle ist "Local" (wie Taster/Touch). Groß-/Kleinschreibung egal.
  ******************************************************************************/
-char   g_inputLine[32] = {};
+char   g_inputLine[48] = {};   // W4e: 48 statt 32 ("uhr stellen JJJJ-MM-TT hh:mm:ss")
 size_t g_inputLength   = 0;
 
 /// Vollständige Blockausgabe (jedes Feld) ein/aus. Standard: aus, damit
@@ -3199,7 +3500,70 @@ bool g_showFrames = false;
 void printHelp()
 {
     Serial.println("[HILFE] Befehle: r1|r2|r3 ein|aus | override ein|aus | "
-                   "bloecke ein|aus | hex (Diagnose) | hilfe");
+                   "bloecke ein|aus | hex (Diagnose) | uhr | hilfe");
+}
+
+/// "uhr" (anzeigen) bzw. "uhr stellen JJJJ-MM-TT hh:mm:ss" (UTC!). W4e Schritt 2.
+void handleClockCommand(const char* args)
+{
+    // Systemuhr (W4e Schritt 3): Zeit, Quelle, Zeitzone
+    const uint32_t now = clockNowUnix();
+    Serial.printf("[UHR] System: %s (Quelle: %s, Zeitzone %s, NTP-Server %s)\n",
+                  clockValid() ? formatLocalTime(now).c_str() : "nicht gestellt",
+                  clockSourceKey(static_cast<ClockSource>(g_clockSource.load())),
+                  g_tzKey.c_str(), g_ntpServer);
+
+    I2cLock lock;   // RTC wird auch aus der webTask benutzt
+    if (!lock.ok())
+    {
+        Serial.println("[UHR] I²C gerade belegt, bitte erneut versuchen");
+        return;
+    }
+
+    if (!g_rtcFound)
+    {
+        // Evtl. erst nachträglich angeschlossen: noch einmal suchen
+        g_rtcFound = g_rtc.begin();
+        if (!g_rtcFound)
+        {
+            Serial.println("[UHR] RTC nicht gefunden (I²C GPIO 21 SDA / 22 SCL, Adresse 0x68)");
+            return;
+        }
+        Serial.println("[UHR] RTC jetzt gefunden");
+    }
+
+    unsigned y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    if (std::sscanf(args, " stellen %u-%u-%u %u:%u:%u", &y, &mo, &d, &h, &mi, &s) == 6)
+    {
+        Rtc::DateTime t;
+        t.year = static_cast<uint16_t>(y); t.month = static_cast<uint8_t>(mo); t.day = static_cast<uint8_t>(d);
+        t.hour = static_cast<uint8_t>(h);  t.minute = static_cast<uint8_t>(mi); t.second = static_cast<uint8_t>(s);
+        if (!t.isValid())
+        {
+            Serial.println("[UHR] ungültiges Datum (2000..2099, Format JJJJ-MM-TT hh:mm:ss, UTC)");
+            return;
+        }
+        Serial.println(g_rtc.write(t) ? "[UHR] gestellt (UTC)" : "[UHR] Schreiben fehlgeschlagen");
+    }
+    else if (args[0] != '\0')
+    {
+        Serial.println("[UHR] Befehle: uhr | uhr stellen JJJJ-MM-TT hh:mm:ss (UTC)");
+        return;
+    }
+
+    Rtc::DateTime t;
+    if (g_rtc.read(t))
+    {
+        Serial.printf("[UHR] %s: %04u-%02u-%02u %02u:%02u:%02u UTC, Unix %lu%s\n", g_rtc.name(),
+                      t.year, t.month, t.day, t.hour, t.minute, t.second,
+                      static_cast<unsigned long>(Rtc::toUnix(t)),
+                      g_rtc.batteryLow() ? ", Knopfzelle schwach/fehlt" : ", Knopfzelle ok");
+    }
+    else
+    {
+        Serial.printf("[UHR] %s: Zeit UNGÜLTIG (noch nie gestellt oder Stromausfall ohne Knopfzelle)%s\n",
+                      g_rtc.name(), g_rtc.batteryLow() ? ", Knopfzelle schwach/fehlt" : "");
+    }
 }
 
 void printHexHelp()
@@ -3342,6 +3706,13 @@ void handleCommandLine(char* line)
     {
         g_showFrames = false;
         Serial.println("[AUSGABE] Blockausgabe AUS (nur Status, Ereignisse, Befehle)");
+        return;
+    }
+
+    // ---- W4e: Echtzeituhr ----
+    if (std::strncmp(line, "uhr", 3) == 0 && (line[3] == ' ' || line[3] == '\0'))
+    {
+        handleClockCommand(line + 3);
         return;
     }
 
@@ -3617,6 +3988,33 @@ void setup()
     // W4a Schritt 5: gewählte Anlage (Camper/Balkonkraftwerk) aus dem NVS,
     // bevor die systemTask die Relais-Voreinstellung lädt
     loadInstallation();
+
+    // W4e: Echtzeituhr (PCF8523 an I²C, GPIO 21 SDA / 22 SCL). Zeitzone und
+    // NTP-Server aus dem NVS; gültige RTC-Zeit stellt sofort die Systemuhr.
+    g_i2cMutex = xSemaphoreCreateMutex();
+    loadClockSettings();
+    Wire.begin(RtcSdaPin, RtcSclPin);
+    g_rtcFound = g_rtc.begin();
+    if (g_rtcFound)
+    {
+        Rtc::DateTime t;
+        const bool valid = g_rtc.read(t);
+        if (valid)
+        {
+            setSystemClock(Rtc::toUnix(t), ClockSource::Rtc);
+            Serial.printf("RTC %s: %04u-%02u-%02u %02u:%02u:%02u UTC%s\n", g_rtc.name(), t.year, t.month, t.day,
+                          t.hour, t.minute, t.second, g_rtc.batteryLow() ? "  (Knopfzelle schwach/fehlt)" : "");
+        }
+        else
+        {
+            Serial.printf("RTC %s gefunden, Zeit UNGÜLTIG (noch nie gestellt oder Stromausfall ohne Knopfzelle)\n",
+                          g_rtc.name());
+        }
+    }
+    else
+    {
+        Serial.println("RTC: nicht gefunden (I²C GPIO 21/22) – Zeit nur über NTP/Browser");
+    }
 
     // W4a: Grund des Neustarts als erstes Ereignis (Absturz, Watchdog,
     // Brownout = kritisch)
