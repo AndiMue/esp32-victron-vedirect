@@ -155,6 +155,12 @@ void decodePing(uint16_t raw, uint16_t& version, uint8_t& type);
 /******************************************************************************
  * MPPT-Historie (Register 0x104F gesamt, 0x1050..0x106E Tage)
  ******************************************************************************/
+/// Fähigkeiten des MPPT (un32). Bit 0 = echter Lastausgang vorhanden.
+/// (Bit 19 = "virtueller" Lastausgang über den TX-Pin – den nutzen wir
+/// für die Kommunikation, daher für die Anzeige nicht relevant.)
+constexpr uint16_t RegCapabilities  = 0x0140;
+constexpr uint32_t CapLoadOutput    = 0x00000001;
+
 constexpr uint16_t RegHistoryTotal = 0x104F;
 constexpr uint16_t RegHistoryToday = 0x1050;   ///< 0x1050 + n = vor n Tagen
 constexpr uint8_t  HistoryDays     = 31;       ///< 0x1050..0x106E
@@ -167,6 +173,7 @@ struct HistoryDay
     bool     consumedValid      = false;
     uint32_t consumedWh         = 0;
     uint16_t batteryMaxCentiV   = 0;       ///< 0,01 V
+    bool     batteryMinValid    = false;   ///< Finding 12.11.2026: MPPT FW 1.59 meldet oft 0 = nicht erfasst
     uint16_t batteryMinCentiV   = 0;
     uint8_t  errors[4]          = {};      ///< [0] = jüngster Fehlercode (siehe ERR)
     uint16_t bulkMin            = 0;

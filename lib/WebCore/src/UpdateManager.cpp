@@ -27,8 +27,10 @@ const char* const Ns          = "ota";
 const char* const KeyTrial    = "trial";
 const char* const KeyBoots    = "boots";
 const char* const KeyRollback = "rolledback";
+const char* const KeyWebPrev  = "webprev";   ///< /_prev gehört zur Firmware vor dem Paket-Update
 
-const char* const NewDir = "/_new";   ///< Zwischenordner für die neue WebUI
+const char* const NewDir  = "/_new";    ///< Zwischenordner für die neue WebUI
+const char* const PrevDir = "/_prev";   ///< vorherige WebUI (Finding 12.11.2026, für den Rückfall)
 
 constexpr uint8_t EspImageMagic = 0xE9;
 
@@ -132,6 +134,25 @@ bool moveTree(const String& from, const String& to)
     return ok;
 }
 
+/// Vorherige WebUI aus /_prev zurückholen (Rückfall nach Paket-Update).
+/// Aktuelle Dateien (außer den Arbeitsordnern) werden gelöscht.
+bool restorePreviousWebUi()
+{
+    if (!LittleFS.exists(PrevDir))
+    {
+        return false;
+    }
+    for (const DirEntry& e : listDir("/"))
+    {
+        const String path = joinPath("/", e.name);
+        if (path == PrevDir || path == NewDir) continue;
+        if (e.isDir) removeRecursive(path); else LittleFS.remove(path);
+    }
+    const bool ok = moveTree(PrevDir, "/");
+    removeRecursive(PrevDir);
+    return ok;
+}
+
 } // namespace
 
 /******************************************************************************
@@ -157,6 +178,21 @@ void UpdateManager::checkTrialBoot()
     SettingsStore::putBool(Ns, KeyTrial, false);
     SettingsStore::putUInt(Ns, KeyBoots, 0);
 
+    // Finding 12.11.2026: Der Rückfall schaltet nur die Firmware um. Kam die
+    // neue Firmware mit einem PAKET (Firmware + WebUI), auch die vorherige
+    // WebUI zurückholen, damit beide wieder zusammenpassen. Das erledigt die
+    // (fehlerhafte) neue Firmware hier selbst – die alte kennt den Code evtl.
+    // noch nicht.
+    if (SettingsStore::getBool(Ns, KeyWebPrev, false))
+    {
+        if (LittleFS.begin(false))
+        {
+            restorePreviousWebUi();
+            LittleFS.end();
+        }
+        SettingsStore::putBool(Ns, KeyWebPrev, false);
+    }
+
     const esp_partition_t* previous = esp_ota_get_next_update_partition(nullptr);
     if (previous != nullptr && esp_ota_set_boot_partition(previous) == ESP_OK)
     {
@@ -172,6 +208,7 @@ void UpdateManager::confirmStable()
     {
         SettingsStore::putBool(Ns, KeyTrial, false);
         SettingsStore::putUInt(Ns, KeyBoots, 0);
+        SettingsStore::putBool(Ns, KeyWebPrev, false);   // kein Rückfall mehr möglich
     }
 }
 
@@ -261,6 +298,8 @@ void UpdateManager::end()
     {
         if (!m_fwStarted) { fail("Leere Datei"); return; }
         if (!firmwareEnd()) return;
+        // Nur Firmware: WebUI unverändert -> beim Rückfall nichts zurückholen
+        SettingsStore::putBool(Ns, KeyWebPrev, false);
         m_state = State::Success;
         m_message = "Firmware aktualisiert. Neustart …";
         m_restartRequired = true;
@@ -308,6 +347,9 @@ void UpdateManager::end()
     }
 
     m_state = State::Success;
+    // Bei einem Rückfall nur dann die vorherige WebUI zurückholen, wenn sie
+    // zusammen mit der Firmware getauscht wurde (Paket).
+    SettingsStore::putBool(Ns, KeyWebPrev, m_kind == Kind::Package);
     if (m_kind == Kind::Package)
     {
         m_message = "Firmware und WebUI aktualisiert. Neustart …";
@@ -537,16 +579,29 @@ void UpdateManager::tarEntryEnd()
 }
 
 /******************************************************************************
- * Neue WebUI übernehmen: alte Dateien löschen, /_new nach / verschieben
+ * Neue WebUI übernehmen: bisherige Dateien nach /_prev verschieben (für einen
+ * Rückfall, Finding 12.11.2026), /_new nach / verschieben.
  ******************************************************************************/
 bool UpdateManager::swapWebUi()
 {
-    // Alles außer /_new entfernen
+    // Ältere Sicherung verwerfen, bisherige WebUI nach /_prev
+    removeRecursive(PrevDir);
+    LittleFS.mkdir(PrevDir);
     for (const DirEntry& e : listDir("/"))
     {
         const String path = joinPath("/", e.name);
-        if (path == NewDir) continue;
-        if (e.isDir) removeRecursive(path); else LittleFS.remove(path);
+        if (path == NewDir || path == PrevDir) continue;
+        const String dst = joinPath(PrevDir, e.name);
+        if (e.isDir)
+        {
+            LittleFS.mkdir(dst);
+            moveTree(path, dst);
+            removeRecursive(path);
+        }
+        else if (!LittleFS.rename(path, dst))
+        {
+            LittleFS.remove(path);   // Sicherung ist "nice to have" – Update nicht blockieren
+        }
     }
 
     const bool ok = moveTree(NewDir, "/");

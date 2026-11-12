@@ -121,6 +121,15 @@ let lastStatus = null;
 async function refreshStatus() {
   try {
     const s = await api("/api/status");
+    // Finding 12.11.2026: Die Seite war während eines Updates offen, das alte
+    // Skript lief mit Daten der neuen Firmware weiter (Folgefehler). Neue
+    // WebUI-Version auf dem Gerät erkannt -> Seite neu laden.
+    if (refreshStatus.webui && s.webui && s.webui !== refreshStatus.webui) {
+      toast("Neue WebUI-Version " + s.webui + " auf dem Gerät – Seite wird neu geladen …");
+      setTimeout(() => location.reload(), 1500);
+      return;
+    }
+    refreshStatus.webui = refreshStatus.webui || s.webui;
     const w = s.wifi;
     $("deviceName").textContent = s.device;
     $("stState").textContent = stateText[w.state] || w.state;
@@ -602,10 +611,16 @@ async function readHex(role) {
   const hexReading = readHex.running || (readHex.running = {});   // je Rolle: läuft gerade
   if (hexReading[role]) return;
   hexReading[role] = true;
-  // Ein Lesen füllt alle Anzeigen dieser Rolle (MPPT: Historie + Einstellungen)
+  // Ein Lesen füllt alle Anzeigen dieser Rolle (MPPT: Historie + Einstellungen).
+  // Fehler beim Zeichnen sind KEIN Verbindungsproblem (Finding 12.11.2026:
+  // wurden als "Keine Verbindung zum Gerät" gemeldet) -> eigene Meldung.
   const render = (h) => {
-    if (role === "mppt") renderMpptHistory(h);
-    renderHexSettings(role, h);
+    try {
+      if (role === "mppt") renderMpptHistory(h);
+      renderHexSettings(role, h);
+    } catch (e) {
+      toast("Anzeigefehler (" + role + "): " + e.message + " – Seite neu laden (Strg+F5)", true);
+    }
   };
   try {
     const r = await api("/api/hex/refresh", { role: role });
@@ -713,7 +728,7 @@ function renderMpptHistory(h) {
   }).join("") + '<div class="barlabels"><span>vor 30 Tagen</span><span>max. ' + fmtKWh(max) + "</span><span>heute</span></div>";
 
   // Tabelle (heute oben)
-  const head = "<tr><th>Tag</th><th>Ertrag</th><th>P max</th><th>Batterie min–max</th>" +
+  const head = "<tr><th>Tag</th><th>Ertrag</th><th>P max</th><th>Batterie min / max</th>" +
     "<th>Bulk / Abs. / Erh.</th><th>Fehler</th></tr>";
   $("hxDays").innerHTML = head + h.history.days.map((d) => {
     if (d.state !== "ok") {
@@ -721,7 +736,8 @@ function renderMpptHistory(h) {
         escapeHtml(hexStateText[d.state] || d.state) + "</td></tr>";
     }
     return "<tr><td>" + dayLabel(d.ago, h.today) + "</td><td>" + fmtKWh(d.yieldKWh) + "</td><td>" + d.powerMaxW + " W</td>" +
-      "<td>" + num(d.batteryMinV, 2) + "–" + num(d.batteryMaxV, 2) + " V</td>" +
+      // Minimum kann fehlen (null): MPPT meldet oft 0 = nicht erfasst
+      "<td>" + (d.batteryMinV === null ? "–" : num(d.batteryMinV, 2)) + " / " + num(d.batteryMaxV, 2) + " V</td>" +
       "<td>" + fmtMin(d.bulkMin) + " / " + fmtMin(d.absorptionMin) + " / " + fmtMin(d.floatMin) + "</td>" +
       '<td class="' + (d.errors.length ? "err" : "") + '">' + (d.errors.length ? escapeHtml(d.errors.join(", ")) : "–") + "</td></tr>";
   }).join("");

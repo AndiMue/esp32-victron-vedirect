@@ -1,6 +1,6 @@
 # Bedienungsanleitung – VE.Direct Steuergerät
 
-> **Stand:** 11.11.2026, Firmware und WebUI ab `26.11.11-1857`
+> **Stand:** 12.11.2026, Firmware und WebUI ab `26.11.12-1817`
 > **Status:** Entwurf, wächst mit jeder Entwicklungsstufe mit.
 > Abschnitte mit *„folgt“* sind noch nicht umgesetzt.
 
@@ -322,6 +322,8 @@ Updates werden unter **System → Update** als Datei hochgeladen (nur mit Anmeld
 
 - Während des Updates zeigt das Display **UPD**. Gerät dabei **nicht ausschalten**.
 - Nach einem Firmware-Update läuft die neue Firmware **auf Probe**. Startet sie dreimal hintereinander nicht stabil (60 s), schaltet das Gerät **automatisch auf die vorherige Firmware zurück**, zeigt unter *System → Update* einen Hinweis und trägt es in die Ereignisliste ein.
+- War es ein **Paket-Update**, wird dabei auch die **vorherige Weboberfläche** wiederhergestellt, sodass Firmware und Weboberfläche wieder zusammenpassen. Deshalb ist das Paket der empfohlene Weg. „Nur Firmware“ bzw. „Nur WebUI“ nur verwenden, wenn beide aus derselben Version stammen (gleiche Versionsnummer).
+- Ist die Weboberfläche während eines Updates geöffnet (z. B. Update von einem anderen Gerät aus), lädt sie sich nach dem Update selbst neu.
 - Falsche Dateien werden abgelehnt (z. B. ein Paket unter „Nur WebUI“).
 - Nach dem Neustart gilt der Startzustand der Relais (Kapitel 7).
 - Nach einem WebUI-Update die Seite mit **Strg+F5** neu laden, damit der Browser keine alten Dateien verwendet.
@@ -526,7 +528,7 @@ Das Gerät kann damit **nur lesen**. Befehle zum Verstellen der Victron-Geräte 
 | `hex get <Register> [1\|2]` | ein Register lesen, Register als Hex-Zahl, z. B. `hex get 1000 1` |
 | `hex lesen [1\|2]` | automatische Abfrage neu starten (Shunt: Einstellungen; MPPT: Einstellungen + Historie) |
 | `hex cache [1\|2]` | zuletzt gelesene Werte anzeigen (Register, Zustand, Alter, Rohwert) |
-| `hex async ein` / `hex async aus` | ungefragte Meldungen des MPPT (`:A…`) anzeigen bzw. ausblenden |
+| `hex async ein` / `hex async aus` | ungefragte Meldungen des MPPT (`:A…`) anzeigen bzw. ausblenden. **Standard: aus.** Der MPPT (ab FW 1.53) sendet nach jeder HEX-Anfrage 2 min lang solche Meldungen, z. B. sekündlich die Ladespannung (0xEDD5) – normal und harmlos |
 
 Ausgabe einer Anfrage, z. B.:
 ```

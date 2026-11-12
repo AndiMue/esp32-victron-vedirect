@@ -232,7 +232,8 @@ const uint16_t MpptRegisters[] =
     0xEDF0,   // max. Ladestrom (0,1 A)
     0xEDF1,   // Batterietyp
     0xEDF2,   // Temperaturkompensation (0,01 mV/K)
-    0xEDAB,   // Lastausgang (nur Modelle mit Lastausgang, sonst "unbekannt")
+    0xEDAB,   // Lastausgang (antwortet auch ohne echten Lastausgang, siehe 0x0140)
+    0x0140,   // Fähigkeiten (Bit 0 = echter Lastausgang); Finding 12.11.2026
     0x104F,   // Historie gesamt
     0x1050, 0x1051, 0x1052, 0x1053, 0x1054, 0x1055, 0x1056, 0x1057,
     0x1058, 0x1059, 0x105A, 0x105B, 0x105C, 0x105D, 0x105E, 0x105F,

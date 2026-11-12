@@ -11,6 +11,7 @@
 
 #include <unity.h>
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -321,6 +322,76 @@ void test_history_total_fw116_and_fw117()
 }
 
 /******************************************************************************
+ * Echte Datensätze: SmartSolar 100/50, FW 1.59 (Projektinhaber 12.11.2026)
+ ******************************************************************************/
+namespace
+{
+/// Hex-Text "00 2D 00 ..." in Bytes wandeln.
+std::size_t bytesFrom(const char* text, uint8_t* out, std::size_t max)
+{
+    std::size_t n = 0;
+    unsigned v = 0;
+    int pos = 0;
+    while (*text && n < max)
+    {
+        if (std::sscanf(text, "%2x%n", &v, &pos) != 1) break;
+        out[n++] = static_cast<uint8_t>(v);
+        text += pos;
+        while (*text == ' ') ++text;
+    }
+    return n;
+}
+} // namespace
+
+void test_real_mppt_day_record()
+{
+    // 0x1055 (vor 5 Tagen)
+    uint8_t v[34];
+    TEST_ASSERT_EQUAL_UINT32(34, bytesFrom(
+        "00 2D 00 00 00 FF FF FF FF A0 05 00 00 00 00 00 00 00 39 01 01 00 CA 00 1C 01 00 00 CE 00 FC 0F 26 00",
+        v, sizeof(v)));
+    HistoryDay d;
+    TEST_ASSERT_TRUE(decodeHistoryDay(v, 34, 0, d));
+    TEST_ASSERT_TRUE(d.valid);
+    TEST_ASSERT_EQUAL_UINT32(450, d.yieldWh);             // 0,45 kWh
+    TEST_ASSERT_FALSE(d.consumedValid);                   // kein Lastausgang
+    TEST_ASSERT_EQUAL_UINT16(1440, d.batteryMaxCentiV);   // 14,40 V
+    TEST_ASSERT_FALSE(d.batteryMinValid);                 // 0 = nicht erfasst (Finding)
+    TEST_ASSERT_EQUAL_UINT16(313, d.bulkMin);
+    TEST_ASSERT_EQUAL_UINT16(1, d.absorptionMin);
+    TEST_ASSERT_EQUAL_UINT16(202, d.floatMin);
+    TEST_ASSERT_EQUAL_UINT32(284, d.powerMaxW);
+    TEST_ASSERT_EQUAL_UINT16(206, d.batteryCurrentMaxDeciA);   // 20,6 A
+    TEST_ASSERT_EQUAL_UINT16(4092, d.panelMaxCentiV);          // 40,92 V
+    TEST_ASSERT_EQUAL_UINT16(38, d.sequence);
+
+    // 0x1050 (heute): Minimum hier vorhanden
+    TEST_ASSERT_EQUAL_UINT32(34, bytesFrom(
+        "00 00 00 00 00 FF FF FF FF CE 04 CD 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 2B 00",
+        v, sizeof(v)));
+    TEST_ASSERT_TRUE(decodeHistoryDay(v, 34, 0, d));
+    TEST_ASSERT_TRUE(d.batteryMinValid);
+    TEST_ASSERT_EQUAL_UINT16(1229, d.batteryMinCentiV);   // 12,29 V
+    TEST_ASSERT_EQUAL_UINT16(43, d.sequence);
+}
+
+void test_real_mppt_total_record()
+{
+    uint8_t v[34];
+    TEST_ASSERT_EQUAL_UINT32(34, bytesFrom(
+        "01 00 00 00 00 00 3D 0D 00 00 3D 0D 00 00 13 10 AF 05 1E 00 00 FF FF FF FF FF FF FF FF FF FF FF FF FF",
+        v, sizeof(v)));
+    HistoryTotal t;
+    TEST_ASSERT_TRUE(decodeHistoryTotal(v, 34, t));
+    TEST_ASSERT_EQUAL_UINT32(33890, t.userYieldWh);       // 33,89 kWh
+    TEST_ASSERT_EQUAL_UINT32(33890, t.systemYieldWh);
+    TEST_ASSERT_EQUAL_UINT16(4115, t.panelMaxCentiV);     // 41,15 V
+    TEST_ASSERT_EQUAL_UINT16(1455, t.batteryMaxCentiV);   // 14,55 V
+    TEST_ASSERT_EQUAL_UINT8(30, t.daysAvailable);
+    TEST_ASSERT_FALSE(t.batteryMinValid);                 // 0 = nicht erfasst
+}
+
+/******************************************************************************
  * Testlauf
  ******************************************************************************/
 int runAllTests()
@@ -347,6 +418,8 @@ int runAllTests()
     RUN_TEST(test_history_day_without_data);
     RUN_TEST(test_history_day_unknown_or_short);
     RUN_TEST(test_history_total_fw116_and_fw117);
+    RUN_TEST(test_real_mppt_day_record);
+    RUN_TEST(test_real_mppt_total_record);
     return UNITY_END();
 }
 

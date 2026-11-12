@@ -2534,7 +2534,8 @@ String buildHistoryJson()
         j += ",\"yieldKWh\":"      + jsonScaled(d.yieldWh, 1000.0f, 2);
         j += ",\"consumedKWh\":"   + (d.consumedValid ? jsonScaled(d.consumedWh, 1000.0f, 2) : String("null"));
         j += ",\"batteryMaxV\":"   + jsonScaled(d.batteryMaxCentiV, 100.0f, 2);
-        j += ",\"batteryMinV\":"   + jsonScaled(d.batteryMinCentiV, 100.0f, 2);
+        j += ",\"batteryMinV\":"   + (d.batteryMinValid ? jsonScaled(d.batteryMinCentiV, 100.0f, 2)
+                                                            : String("null"));   // 0 = nicht erfasst
         j += ",\"bulkMin\":"       + String(d.bulkMin);
         j += ",\"absorptionMin\":" + String(d.absorptionMin);
         j += ",\"floatMin\":"      + String(d.floatMin);
@@ -2657,6 +2658,7 @@ String formatHexSetting(const HexSetting& s, const HexRegisterCache::Entry& e)
             const float v = (s.isSigned ? static_cast<float>(VeHex::readSigned(e.value, e.length))
                                         : static_cast<float>(raw)) / s.divisor;
             String text = String(v, static_cast<unsigned int>(s.decimals));
+            text.trim();   // Finding 12.11.2026: Arduino füllt bei 0 Nachkommastellen links auf (" 3")
             text.replace('.', ',');
             return s.unit[0] ? text + " " + s.unit : text;
         }
@@ -2679,6 +2681,19 @@ String buildSettingsListJson(bool shunt)
         if (e != nullptr && e->state == HexRegisterCache::State::Unknown)
         {
             continue;
+        }
+        // Finding 12.11.2026: Der SmartSolar 100/50 beantwortet 0xEDAB, obwohl
+        // er keinen Lastausgang hat (nur "virtuell" über den TX-Pin, den wir
+        // selbst nutzen). Lastausgang nur zeigen, wenn Fähigkeit Bit 0 gesetzt.
+        if (list[i].format == HexFormat::LoadOutput)
+        {
+            const HexRegisterCache::Entry* cap = g_webHexCache.find(VeHex::RegCapabilities);
+            const bool hasLoad = cap != nullptr && cap->state == HexRegisterCache::State::Ok &&
+                                 (VeHex::readUnsigned(cap->value, cap->length) & VeHex::CapLoadOutput) != 0;
+            if (!hasLoad)
+            {
+                continue;
+            }
         }
         const bool ok = e != nullptr && e->state == HexRegisterCache::State::Ok && e->length > 0;
         if (!first) j += ",";
@@ -3393,7 +3408,7 @@ void printDeviceEvent(const LogMessage& msg)
  ******************************************************************************/
 /// Ungefragte HEX-Meldungen (":A…") anzeigen? Der MPPT sendet nach einer
 /// Anfrage ggf. 2 min lang viele davon ("hex async aus" zum Abschalten).
-bool g_showHexAsync = true;
+bool g_showHexAsync = false;   // Standard aus (12.11.2026): echter MPPT sendet 2 min lang sekündlich
 
 /// Abstand zum letzten gültigen Textblock (zeigt, ob Textblöcke pausieren).
 void printTextGap(const LogMessage& msg)

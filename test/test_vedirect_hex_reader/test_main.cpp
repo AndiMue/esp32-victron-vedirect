@@ -116,10 +116,11 @@ void test_job_lists()
     TEST_ASSERT_EQUAL_HEX16(0x1000, s[0]);
 
     const uint16_t* m = HexJobs::mppt(n);
-    TEST_ASSERT_EQUAL_UINT32(39, n);   // 7 Einstellungen + gesamt + 31 Tage
+    TEST_ASSERT_EQUAL_UINT32(40, n);   // 7 Einstellungen + Fähigkeiten + gesamt + 31 Tage
     TEST_ASSERT_TRUE(n <= HexJobRunner::MaxRegisters);
-    TEST_ASSERT_EQUAL_HEX16(0x104F, m[7]);
-    TEST_ASSERT_EQUAL_HEX16(0x1050, m[8]);
+    TEST_ASSERT_EQUAL_HEX16(0x0140, m[7]);
+    TEST_ASSERT_EQUAL_HEX16(0x104F, m[8]);
+    TEST_ASSERT_EQUAL_HEX16(0x1050, m[9]);
     TEST_ASSERT_EQUAL_HEX16(0x106E, m[n - 1]);
 }
 
@@ -161,7 +162,7 @@ void test_unknown_register_and_empty_day()
     TEST_ASSERT_TRUE(g_runner.start(regs, n, 0));
     run(dev, 0);
 
-    TEST_ASSERT_EQUAL_UINT16(39, g_runner.result().answered);
+    TEST_ASSERT_EQUAL_UINT16(40, g_runner.result().answered);
     TEST_ASSERT_EQUAL(HexRegisterCache::State::Unknown, g_cache.find(0xEDAB)->state);   // kein Lastausgang
     TEST_ASSERT_EQUAL(HexRegisterCache::State::NoData,  g_cache.find(0x106E)->state);   // Tag ohne Daten
     TEST_ASSERT_EQUAL_UINT8(34, g_cache.find(0x106E)->length);

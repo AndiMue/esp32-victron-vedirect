@@ -298,6 +298,7 @@ bool decodeHistoryDay(const uint8_t* v, std::size_t length, uint8_t flags, Histo
     out.consumedWh       = out.consumedValid ? consumed * 10 : 0;
     out.batteryMaxCentiV = static_cast<uint16_t>(readUnsigned(v + 9, 2));
     out.batteryMinCentiV = static_cast<uint16_t>(readUnsigned(v + 11, 2));
+    out.batteryMinValid  = out.batteryMinCentiV != 0;   // 0 = nicht erfasst (echter MPPT, FW 1.59)
     for (int i = 0; i < 4; ++i)
     {
         out.errors[i] = v[14 + i];
@@ -330,8 +331,9 @@ bool decodeHistoryTotal(const uint8_t* v, std::size_t length, HistoryTotal& out)
     out.daysAvailable    = v[18];
     if (length >= 21)
     {
-        out.batteryMinValid  = true;   // ab FW 1.17 (34 Byte)
+        // ab FW 1.17 (34 Byte); 0 = nicht erfasst (echter MPPT, FW 1.59)
         out.batteryMinCentiV = static_cast<uint16_t>(readUnsigned(v + 19, 2));
+        out.batteryMinValid  = out.batteryMinCentiV != 0;
     }
     return true;
 }

@@ -147,7 +147,8 @@ void WebUi::serveFile(const String& path)
         file += "index.html";
     }
 
-    if (!LittleFS.exists(file))
+    // Arbeitsordner des UpdateManagers (/_new, /_prev) nicht ausliefern
+    if (file.startsWith("/_") || !LittleFS.exists(file))
     {
         g_server.send(404, "text/plain; charset=utf-8",
                       "Datei nicht gefunden. Wurde das Dateisystem (WebUI) hochgeladen?");
